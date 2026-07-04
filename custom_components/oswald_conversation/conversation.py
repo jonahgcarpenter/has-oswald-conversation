@@ -15,6 +15,8 @@ from homeassistant.components.conversation import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import intent
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -45,6 +47,54 @@ class OswaldConversationEntity(ConversationEntity):
     @property
     def supported_languages(self) -> list[str] | str:
         return conversation.MATCH_ALL
+
+    async def _async_home_assistant_identity(
+        self,
+        user_input: ConversationInput,
+    ) -> tuple[str, str]:
+        if user_input.context.user_id:
+            display_name = "Home Assistant"
+            ha_user = await self.hass.auth.async_get_user(user_input.context.user_id)
+            if ha_user is not None and ha_user.name:
+                display_name = ha_user.name
+
+            return f"homeassistant:{user_input.context.user_id}", display_name
+
+        if user_input.device_id:
+            device_reg = dr.async_get(self.hass)
+            device = device_reg.async_get(user_input.device_id)
+            display_name = "Home Assistant Device"
+            if device is not None:
+                display_name = (
+                    device.name_by_user
+                    or device.name
+                    or device.model
+                    or display_name
+                )
+
+            return (
+                f"homeassistant:device:{user_input.device_id}",
+                display_name,
+            )
+
+        if user_input.satellite_id:
+            entity_reg = er.async_get(self.hass)
+            entity = entity_reg.async_get(user_input.satellite_id)
+            display_name = "Home Assistant Satellite"
+            if entity is not None:
+                display_name = (
+                    entity.name
+                    or entity.original_name
+                    or entity.entity_id
+                    or display_name
+                )
+
+            return (
+                f"homeassistant:satellite:{user_input.satellite_id}",
+                display_name,
+            )
+
+        return f"homeassistant:entry:{self.entry.entry_id}", "Home Assistant"
 
     async def _async_handle_message(
         self,
@@ -86,10 +136,12 @@ class OswaldConversationEntity(ConversationEntity):
     ) -> AsyncGenerator[dict[str, Any], None]:
         session = async_get_clientsession(self.hass)
 
-        ha_user_id = user_input.context.user_id or "unknown"
+        oswald_user_id, display_name = await self._async_home_assistant_identity(
+            user_input
+        )
         payload = {
-            "user_id": f"homeassistant:{ha_user_id}",
-            "display_name": "Home Assistant",
+            "user_id": oswald_user_id,
+            "display_name": display_name,
             "prompt": user_input.text,
         }
 
