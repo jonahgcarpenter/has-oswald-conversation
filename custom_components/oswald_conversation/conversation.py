@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import AsyncGenerator
 from typing import Any
 
 from aiohttp import ClientError, WSMsgType
 from homeassistant.components import conversation
 from homeassistant.components.conversation import (
-    AssistantContent,
     ChatLog,
     ConversationEntity,
     ConversationInput,
@@ -51,13 +51,23 @@ class OswaldConversationEntity(ConversationEntity):
         user_input: ConversationInput,
         chat_log: ChatLog,
     ) -> ConversationResult:
-        response_text = await self._send_to_oswald(user_input)
+        state = {
+            "final_response": None,
+            "streamed_text": "",
+            "streamed_content": False,
+            "done": False,
+        }
 
-        chat_log.async_add_assistant_content_without_tools(
-            AssistantContent(
-                agent_id=user_input.agent_id,
-                content=response_text,
-            )
+        async for _content in chat_log.async_add_delta_content_stream(
+            user_input.agent_id,
+            self._async_oswald_delta_stream(user_input, state),
+        ):
+            pass
+
+        response_text = (
+            state["final_response"]
+            or state["streamed_text"]
+            or "I could not reach Oswald."
         )
 
         intent_response = intent.IntentResponse(language=user_input.language)
@@ -69,7 +79,11 @@ class OswaldConversationEntity(ConversationEntity):
             continue_conversation=False,
         )
 
-    async def _send_to_oswald(self, user_input: ConversationInput) -> str:
+    async def _async_oswald_delta_stream(
+        self,
+        user_input: ConversationInput,
+        state: dict[str, Any],
+    ) -> AsyncGenerator[dict[str, Any], None]:
         session = async_get_clientsession(self.hass)
 
         ha_user_id = user_input.context.user_id or "unknown"
@@ -85,19 +99,41 @@ class OswaldConversationEntity(ConversationEntity):
 
                 async for msg in ws:
                     if msg.type == WSMsgType.TEXT:
-                        parsed = self._parse_ws_message(msg.data)
-                        if parsed is not None:
-                            return parsed
+                        delta = self._parse_ws_message(msg.data, state)
+                        if delta is not None:
+                            yield delta
+                        if state["done"]:
+                            break
 
                     if msg.type in (WSMsgType.CLOSED, WSMsgType.ERROR):
                         break
 
         except ClientError as err:
             _LOGGER.warning("Failed to contact Oswald websocket: %s", err)
+            fallback = "I could not reach Oswald."
+            state["final_response"] = fallback
+            state["streamed_content"] = True
+            yield {"content": fallback}
+            return
 
-        return "I could not reach Oswald."
+        if state["streamed_content"]:
+            return
 
-    def _parse_ws_message(self, raw: str) -> str | None:
+        if state["final_response"]:
+            state["streamed_content"] = True
+            yield {"content": state["final_response"]}
+            return
+
+        fallback = "I could not reach Oswald."
+        state["final_response"] = fallback
+        state["streamed_content"] = True
+        yield {"content": fallback}
+
+    def _parse_ws_message(
+        self,
+        raw: str,
+        state: dict[str, Any],
+    ) -> dict[str, Any] | None:
         try:
             data: Any = json.loads(raw)
         except json.JSONDecodeError:
@@ -108,16 +144,32 @@ class OswaldConversationEntity(ConversationEntity):
 
         msg_type = data.get("type")
 
-        # Oswald sends these while generating. Home Assistant needs the final response.
-        if msg_type in {"thinking", "content", "status", "tool_call", "tool_result"}:
+        if msg_type in {"content", "thinking"}:
+            text = data.get("text")
+            if not isinstance(text, str) or not text:
+                return None
+
+            if msg_type == "content":
+                state["streamed_text"] += text
+                state["streamed_content"] = True
+                return {"content": text}
+
+            return {"thinking_content": text}
+
+        if msg_type in {"status", "tool_call", "tool_result"}:
             return None
 
         error = data.get("error")
         if isinstance(error, str) and error.strip():
-            return error.strip()
+            state["final_response"] = error.strip()
+            state["streamed_content"] = True
+            state["done"] = True
+            return {"content": error.strip()}
 
         response = data.get("response")
         if isinstance(response, str) and response.strip():
-            return response.strip()
+            state["final_response"] = response.strip()
+            state["done"] = True
+            return None
 
         return None
