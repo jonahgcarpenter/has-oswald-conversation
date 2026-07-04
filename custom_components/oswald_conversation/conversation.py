@@ -15,6 +15,8 @@ from homeassistant.components.conversation import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import intent
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -58,16 +60,38 @@ class OswaldConversationEntity(ConversationEntity):
 
             return f"homeassistant:{user_input.context.user_id}", display_name
 
-        if satellite_id := getattr(user_input, "satellite_id", None):
+        if user_input.device_id:
+            device_reg = dr.async_get(self.hass)
+            device = device_reg.async_get(user_input.device_id)
+            display_name = "Home Assistant Device"
+            if device is not None:
+                display_name = (
+                    device.name_by_user
+                    or device.name
+                    or device.model
+                    or display_name
+                )
+
             return (
-                f"homeassistant:satellite:{satellite_id}",
-                "Home Assistant Satellite",
+                f"homeassistant:device:{user_input.device_id}",
+                display_name,
             )
 
-        if device_id := getattr(user_input, "device_id", None):
+        if user_input.satellite_id:
+            entity_reg = er.async_get(self.hass)
+            entity = entity_reg.async_get(user_input.satellite_id)
+            display_name = "Home Assistant Satellite"
+            if entity is not None:
+                display_name = (
+                    entity.name
+                    or entity.original_name
+                    or entity.entity_id
+                    or display_name
+                )
+
             return (
-                f"homeassistant:device:{device_id}",
-                "Home Assistant Device",
+                f"homeassistant:satellite:{user_input.satellite_id}",
+                display_name,
             )
 
         return f"homeassistant:entry:{self.entry.entry_id}", "Home Assistant"
