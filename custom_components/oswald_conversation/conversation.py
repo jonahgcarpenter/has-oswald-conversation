@@ -58,6 +58,13 @@ class OswaldConversationEntity(ConversationEntity):
             if ha_user is not None and ha_user.name:
                 display_name = ha_user.name
 
+            _LOGGER.debug(
+                "Resolved Oswald identity from Home Assistant user: "
+                "user_id=%s display_name=%s found=%s",
+                user_input.context.user_id,
+                display_name,
+                ha_user is not None,
+            )
             return f"homeassistant:{user_input.context.user_id}", display_name
 
         if user_input.device_id:
@@ -72,6 +79,13 @@ class OswaldConversationEntity(ConversationEntity):
                     or display_name
                 )
 
+            _LOGGER.debug(
+                "Resolved Oswald identity from Home Assistant device: "
+                "device_id=%s display_name=%s found=%s",
+                user_input.device_id,
+                display_name,
+                device is not None,
+            )
             return (
                 f"homeassistant:device:{user_input.device_id}",
                 display_name,
@@ -89,11 +103,22 @@ class OswaldConversationEntity(ConversationEntity):
                     or display_name
                 )
 
+            _LOGGER.debug(
+                "Resolved Oswald identity from Home Assistant satellite: "
+                "satellite_id=%s display_name=%s found=%s",
+                user_input.satellite_id,
+                display_name,
+                entity is not None,
+            )
             return (
                 f"homeassistant:satellite:{user_input.satellite_id}",
                 display_name,
             )
 
+        _LOGGER.debug(
+            "Resolved Oswald identity from config entry fallback: entry_id=%s",
+            self.entry.entry_id,
+        )
         return f"homeassistant:entry:{self.entry.entry_id}", "Home Assistant"
 
     async def _async_handle_message(
@@ -146,18 +171,39 @@ class OswaldConversationEntity(ConversationEntity):
         }
 
         try:
+            _LOGGER.debug(
+                "Connecting to Oswald websocket: url=%s user_id=%s display_name=%s",
+                self.ws_url,
+                oswald_user_id,
+                display_name,
+            )
             async with session.ws_connect(self.ws_url) as ws:
                 await ws.send_json(payload)
+                _LOGGER.debug(
+                    "Sent Oswald websocket request: user_id=%s display_name=%s "
+                    "prompt_length=%s",
+                    oswald_user_id,
+                    display_name,
+                    len(user_input.text),
+                )
 
                 async for msg in ws:
                     if msg.type == WSMsgType.TEXT:
                         delta = self._parse_ws_message(msg.data, state)
                         if delta is not None:
+                            _LOGGER.debug("Yielding Home Assistant delta: %s", delta)
                             yield delta
                         if state["done"]:
+                            _LOGGER.debug(
+                                "Stopping Oswald websocket stream: terminal frame received"
+                            )
                             break
 
                     if msg.type in (WSMsgType.CLOSED, WSMsgType.ERROR):
+                        _LOGGER.debug(
+                            "Oswald websocket closed or errored: msg_type=%s",
+                            msg.type,
+                        )
                         break
 
         except ClientError as err:
@@ -169,14 +215,28 @@ class OswaldConversationEntity(ConversationEntity):
             return
 
         if state["streamed_content"]:
+            _LOGGER.debug(
+                "Oswald stream completed with streamed content: final_response=%s "
+                "streamed_length=%s",
+                state["final_response"] is not None,
+                len(state["streamed_text"]),
+            )
             return
 
         if state["final_response"]:
+            _LOGGER.debug(
+                "Oswald stream had final response without streamed content; "
+                "yielding fallback delta: length=%s",
+                len(state["final_response"]),
+            )
             state["streamed_content"] = True
             yield {"content": state["final_response"]}
             return
 
         fallback = "I could not reach Oswald."
+        _LOGGER.debug(
+            "Oswald stream ended without content or final response; yielding fallback"
+        )
         state["final_response"] = fallback
         state["streamed_content"] = True
         yield {"content": fallback}
@@ -189,26 +249,49 @@ class OswaldConversationEntity(ConversationEntity):
         try:
             data: Any = json.loads(raw)
         except json.JSONDecodeError:
+            _LOGGER.debug("Ignoring non-JSON Oswald websocket frame: %r", raw)
             return None
 
         if not isinstance(data, dict):
+            _LOGGER.debug("Ignoring non-object Oswald websocket frame: %r", data)
             return None
+
+        if _LOGGER.isEnabledFor(logging.DEBUG):
+            # Deep diagnostics can include prompts, responses, thinking text,
+            # tool arguments, tool results, user IDs, and device/entity IDs.
+            _LOGGER.debug("Received Oswald websocket frame: %s", data)
 
         msg_type = data.get("type")
 
         if msg_type in {"content", "thinking"}:
             text = data.get("text")
             if not isinstance(text, str) or not text:
+                _LOGGER.debug(
+                    "Ignoring Oswald %s frame without text content: %s",
+                    msg_type,
+                    data,
+                )
                 return None
 
             if msg_type == "content":
                 state["streamed_text"] += text
                 state["streamed_content"] = True
+                _LOGGER.debug(
+                    "Received Oswald content chunk: length=%s streamed_length=%s",
+                    len(text),
+                    len(state["streamed_text"]),
+                )
                 return {"content": text}
 
+            _LOGGER.debug("Received Oswald thinking chunk: length=%s", len(text))
             return {"thinking_content": text}
 
-        if msg_type in {"status", "tool_call", "tool_result"}:
+        if msg_type == "status":
+            _LOGGER.debug("Ignoring Oswald status frame")
+            return None
+
+        if msg_type in {"tool_call", "tool_result"}:
+            _LOGGER.debug("Ignoring Oswald tool frame: type=%s", msg_type)
             return None
 
         error = data.get("error")
@@ -216,12 +299,25 @@ class OswaldConversationEntity(ConversationEntity):
             state["final_response"] = error.strip()
             state["streamed_content"] = True
             state["done"] = True
+            _LOGGER.debug(
+                "Received terminal Oswald error frame: length=%s",
+                len(error.strip()),
+            )
             return {"content": error.strip()}
 
         response = data.get("response")
         if isinstance(response, str) and response.strip():
             state["final_response"] = response.strip()
             state["done"] = True
+            _LOGGER.debug(
+                "Received terminal Oswald final response: length=%s",
+                len(response.strip()),
+            )
             return None
 
+        _LOGGER.debug(
+            "Ignoring unrecognized Oswald websocket frame: type=%s keys=%s",
+            msg_type,
+            sorted(data),
+        )
         return None
