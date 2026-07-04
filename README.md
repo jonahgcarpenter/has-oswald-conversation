@@ -2,16 +2,10 @@
 
 Use Oswald AI as a Home Assistant Assist conversation agent.
 
-## Installation with HACS
+## Installation
 
-1. Open HACS.
-2. Go to Integrations.
-3. Open the three-dot menu.
-4. Select Custom repositories.
-5. Add this repository URL.
-6. Select category: Integration.
-7. Install Oswald Conversation.
-8. Restart Home Assistant.
+### Via [HACS](https://hacs.xyz/)
+<a href="https://my.home-assistant.io/redirect/hacs_repository/?owner=jonahgcarpenter&repository=has-oswald-conversation&category=integration" target="_blank"><img src="https://my.home-assistant.io/badges/hacs_repository.svg" alt="Open your Home Assistant instance and open a repository inside the Home Assistant Community Store." /></a>
 
 ## Setup
 
