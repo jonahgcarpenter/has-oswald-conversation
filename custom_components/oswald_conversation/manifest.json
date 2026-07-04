@@ -1,9 +1,7 @@
 {
   "domain": "oswald_conversation",
   "name": "Oswald Conversation",
-  "codeowners": [␍
-    "@jonahgcarpenter"␍
-  ],
+  "codeowners": ["@jonahgcarpenter"],
   "config_flow": true,
   "iot_class": "local_push",
   "documentation": "https://github.com/jonahgcarpenter/has-oswald-conversation",

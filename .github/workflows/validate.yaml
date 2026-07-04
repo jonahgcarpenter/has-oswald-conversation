@@ -1,8 +1,8 @@
 name: Validate
 
 on:
-  release:
-    types: [published]
+  push:
+  pull_request:
 
 jobs:
   validate-hacs:
