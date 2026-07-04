@@ -46,6 +46,32 @@ class OswaldConversationEntity(ConversationEntity):
     def supported_languages(self) -> list[str] | str:
         return conversation.MATCH_ALL
 
+    async def _async_home_assistant_identity(
+        self,
+        user_input: ConversationInput,
+    ) -> tuple[str, str]:
+        if user_input.context.user_id:
+            display_name = "Home Assistant"
+            ha_user = await self.hass.auth.async_get_user(user_input.context.user_id)
+            if ha_user is not None and ha_user.name:
+                display_name = ha_user.name
+
+            return f"homeassistant:{user_input.context.user_id}", display_name
+
+        if satellite_id := getattr(user_input, "satellite_id", None):
+            return (
+                f"homeassistant:satellite:{satellite_id}",
+                "Home Assistant Satellite",
+            )
+
+        if device_id := getattr(user_input, "device_id", None):
+            return (
+                f"homeassistant:device:{device_id}",
+                "Home Assistant Device",
+            )
+
+        return f"homeassistant:entry:{self.entry.entry_id}", "Home Assistant"
+
     async def _async_handle_message(
         self,
         user_input: ConversationInput,
@@ -86,10 +112,12 @@ class OswaldConversationEntity(ConversationEntity):
     ) -> AsyncGenerator[dict[str, Any], None]:
         session = async_get_clientsession(self.hass)
 
-        ha_user_id = user_input.context.user_id or "unknown"
+        oswald_user_id, display_name = await self._async_home_assistant_identity(
+            user_input
+        )
         payload = {
-            "user_id": f"homeassistant:{ha_user_id}",
-            "display_name": "Home Assistant",
+            "user_id": oswald_user_id,
+            "display_name": display_name,
             "prompt": user_input.text,
         }
 
