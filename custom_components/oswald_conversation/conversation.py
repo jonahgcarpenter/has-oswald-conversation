@@ -55,6 +55,7 @@ class OswaldConversationEntity(ConversationEntity):
             "final_response": None,
             "streamed_text": "",
             "streamed_content": False,
+            "done": False,
         }
 
         async for _content in chat_log.async_add_delta_content_stream(
@@ -82,7 +83,7 @@ class OswaldConversationEntity(ConversationEntity):
         self,
         user_input: ConversationInput,
         state: dict[str, Any],
-    ) -> AsyncGenerator[dict[str, str], None]:
+    ) -> AsyncGenerator[dict[str, Any], None]:
         session = async_get_clientsession(self.hass)
 
         ha_user_id = user_input.context.user_id or "unknown"
@@ -101,6 +102,8 @@ class OswaldConversationEntity(ConversationEntity):
                         delta = self._parse_ws_message(msg.data, state)
                         if delta is not None:
                             yield delta
+                        if state["done"]:
+                            break
 
                     if msg.type in (WSMsgType.CLOSED, WSMsgType.ERROR):
                         break
@@ -109,7 +112,6 @@ class OswaldConversationEntity(ConversationEntity):
             _LOGGER.warning("Failed to contact Oswald websocket: %s", err)
             fallback = "I could not reach Oswald."
             state["final_response"] = fallback
-            state["streamed_text"] += fallback
             state["streamed_content"] = True
             yield {"content": fallback}
             return
@@ -118,14 +120,12 @@ class OswaldConversationEntity(ConversationEntity):
             return
 
         if state["final_response"]:
-            state["streamed_text"] += state["final_response"]
             state["streamed_content"] = True
             yield {"content": state["final_response"]}
             return
 
         fallback = "I could not reach Oswald."
         state["final_response"] = fallback
-        state["streamed_text"] += fallback
         state["streamed_content"] = True
         yield {"content": fallback}
 
@@ -133,7 +133,7 @@ class OswaldConversationEntity(ConversationEntity):
         self,
         raw: str,
         state: dict[str, Any],
-    ) -> dict[str, str] | None:
+    ) -> dict[str, Any] | None:
         try:
             data: Any = json.loads(raw)
         except json.JSONDecodeError:
@@ -162,13 +162,14 @@ class OswaldConversationEntity(ConversationEntity):
         error = data.get("error")
         if isinstance(error, str) and error.strip():
             state["final_response"] = error.strip()
-            state["streamed_text"] += error.strip()
             state["streamed_content"] = True
+            state["done"] = True
             return {"content": error.strip()}
 
         response = data.get("response")
         if isinstance(response, str) and response.strip():
             state["final_response"] = response.strip()
+            state["done"] = True
             return None
 
         return None
