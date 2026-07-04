@@ -1,0 +1,14 @@
+{
+  "domain": "oswald_conversation",
+  "name": "Oswald Conversation",
+  "codeowners": [␍
+    "@jonahgcarpenter"␍
+  ],
+  "config_flow": true,
+  "iot_class": "local_push",
+  "documentation": "https://github.com/jonahgcarpenter/has-oswald-conversation",
+  "issue_tracker": "https://github.com/jonahgcarpenter/has-oswald-conversation/issues",
+  "dependencies": ["conversation"],
+  "requirements": [],
+  "version": "v1.0.0"
+}

@@ -1,0 +1,16 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Oswald Conversation",
+        "description": "Connect Home Assistant Assist to an Oswald AI WebSocket gateway.",
+        "data": {
+          "ws_url": "Oswald WebSocket URL"
+        }
+      }
+    },
+    "error": {
+      "invalid_ws_url": "The URL must start with ws:// or wss://"
+    }
+  }
+}
