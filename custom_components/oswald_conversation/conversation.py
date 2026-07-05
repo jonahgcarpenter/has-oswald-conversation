@@ -18,6 +18,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import intent
+from homeassistant.helpers import llm
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -37,6 +38,7 @@ async def async_setup_entry(
 class OswaldConversationEntity(ConversationEntity):
     _attr_has_entity_name = True
     _attr_name = "Oswald"
+    _attr_supports_streaming = True
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         self.hass = hass
@@ -131,6 +133,8 @@ class OswaldConversationEntity(ConversationEntity):
             "streamed_text": "",
             "streamed_content": False,
             "done": False,
+            "needs_assistant_role": False,
+            "pending_tool_call_ids": [],
         }
 
         async for _content in chat_log.async_add_delta_content_stream(
@@ -169,6 +173,8 @@ class OswaldConversationEntity(ConversationEntity):
             "display_name": display_name,
             "prompt": user_input.text,
         }
+
+        yield {"role": "assistant"}
 
         try:
             _LOGGER.debug(
@@ -211,6 +217,11 @@ class OswaldConversationEntity(ConversationEntity):
             fallback = "I could not reach Oswald."
             state["final_response"] = fallback
             state["streamed_content"] = True
+            if state["needs_assistant_role"]:
+                state["needs_assistant_role"] = False
+                yield {"role": "assistant", "content": fallback}
+                return
+
             yield {"content": fallback}
             return
 
@@ -230,6 +241,11 @@ class OswaldConversationEntity(ConversationEntity):
                 len(state["final_response"]),
             )
             state["streamed_content"] = True
+            if state["needs_assistant_role"]:
+                state["needs_assistant_role"] = False
+                yield {"role": "assistant", "content": state["final_response"]}
+                return
+
             yield {"content": state["final_response"]}
             return
 
@@ -239,6 +255,11 @@ class OswaldConversationEntity(ConversationEntity):
         )
         state["final_response"] = fallback
         state["streamed_content"] = True
+        if state["needs_assistant_role"]:
+            state["needs_assistant_role"] = False
+            yield {"role": "assistant", "content": fallback}
+            return
+
         yield {"content": fallback}
 
     def _parse_ws_message(
@@ -281,18 +302,28 @@ class OswaldConversationEntity(ConversationEntity):
                     len(text),
                     len(state["streamed_text"]),
                 )
+                if state["needs_assistant_role"]:
+                    state["needs_assistant_role"] = False
+                    return {"role": "assistant", "content": text}
+
                 return {"content": text}
 
             _LOGGER.debug("Received Oswald thinking chunk: length=%s", len(text))
+            if state["needs_assistant_role"]:
+                state["needs_assistant_role"] = False
+                return {"role": "assistant", "thinking_content": text}
+
             return {"thinking_content": text}
 
         if msg_type == "status":
             _LOGGER.debug("Ignoring Oswald status frame")
             return None
 
-        if msg_type in {"tool_call", "tool_result"}:
-            _LOGGER.debug("Ignoring Oswald tool frame: type=%s", msg_type)
-            return None
+        if msg_type == "tool_call":
+            return self._parse_tool_call(data, state)
+
+        if msg_type == "tool_result":
+            return self._parse_tool_result(data, state)
 
         error = data.get("error")
         if isinstance(error, str) and error.strip():
@@ -303,6 +334,10 @@ class OswaldConversationEntity(ConversationEntity):
                 "Received terminal Oswald error frame: length=%s",
                 len(error.strip()),
             )
+            if state["needs_assistant_role"]:
+                state["needs_assistant_role"] = False
+                return {"role": "assistant", "content": error.strip()}
+
             return {"content": error.strip()}
 
         response = data.get("response")
@@ -321,3 +356,93 @@ class OswaldConversationEntity(ConversationEntity):
             sorted(data),
         )
         return None
+
+    def _parse_tool_call(
+        self,
+        data: dict[str, Any],
+        state: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        tool = data.get("tool")
+        if not isinstance(tool, dict):
+            _LOGGER.debug(
+                "Ignoring Oswald tool call frame without tool object: %s",
+                data,
+            )
+            return None
+
+        tool_name = tool.get("name")
+        if not isinstance(tool_name, str) or not tool_name:
+            _LOGGER.debug("Ignoring Oswald tool call frame without tool name: %s", data)
+            return None
+
+        arguments = tool.get("arguments")
+        if not isinstance(arguments, dict):
+            arguments = {}
+
+        tool_input = llm.ToolInput(
+            tool_name=tool_name,
+            tool_args=arguments,
+            external=True,
+        )
+        state["pending_tool_call_ids"].append(tool_input.id)
+        _LOGGER.debug(
+            "Received Oswald tool call: name=%s id=%s args=%s",
+            tool_name,
+            tool_input.id,
+            arguments,
+        )
+        return {"tool_calls": [tool_input]}
+
+    def _parse_tool_result(
+        self,
+        data: dict[str, Any],
+        state: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        tool = data.get("tool")
+        if not isinstance(tool, dict):
+            _LOGGER.debug(
+                "Ignoring Oswald tool result frame without tool object: %s",
+                data,
+            )
+            return None
+
+        tool_name = tool.get("name")
+        if not isinstance(tool_name, str) or not tool_name:
+            _LOGGER.debug(
+                "Ignoring Oswald tool result frame without tool name: %s",
+                data,
+            )
+            return None
+
+        pending_tool_call_ids = state["pending_tool_call_ids"]
+        if pending_tool_call_ids:
+            tool_call_id = pending_tool_call_ids.pop(0)
+        else:
+            tool_call_id = llm.ToolInput(
+                tool_name=tool_name,
+                tool_args={},
+                external=True,
+            ).id
+
+        tool_result = {
+            "name": tool_name,
+            "arguments": tool.get("arguments") or {},
+            "result_text": tool.get("result_text"),
+            "duration_ms": tool.get("duration_ms"),
+            "is_error": tool.get("is_error", False),
+            "soul": tool.get("soul"),
+        }
+        _LOGGER.debug(
+            "Received Oswald tool result: name=%s id=%s is_error=%s duration_ms=%s",
+            tool_name,
+            tool_call_id,
+            tool_result["is_error"],
+            tool_result["duration_ms"],
+        )
+        state["needs_assistant_role"] = True
+        return {
+            "role": "tool_result",
+            "tool_call_id": tool_call_id,
+            "tool_name": tool_name,
+            "tool_result": tool_result,
+        }
