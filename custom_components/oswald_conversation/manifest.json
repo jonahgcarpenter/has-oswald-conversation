@@ -8,5 +8,5 @@
   "issue_tracker": "https://github.com/jonahgcarpenter/has-oswald-conversation/issues",
   "dependencies": ["conversation"],
   "requirements": [],
-  "version": "v1.0.3"
+  "version": "v1.0.4"
 }
