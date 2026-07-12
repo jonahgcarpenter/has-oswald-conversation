@@ -7,6 +7,13 @@
         "data": {
           "ws_url": "Oswald WebSocket URL"
         }
+      },
+      "reconfigure": {
+        "title": "Reconfigure Oswald Conversation",
+        "description": "Update the Oswald AI WebSocket gateway.",
+        "data": {
+          "ws_url": "Oswald WebSocket URL"
+        }
       }
     },
     "error": {
