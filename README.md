@@ -13,10 +13,10 @@ Use Oswald AI as a Home Assistant conversation agent.
 1. Go to Settings -> Devices & services.
 2. Add Integration.
 3. Search for Oswald Conversation.
-4. Enter your Oswald WebSocket URL.
+4. Enter the Oswald Home Assistant WebSocket URL and authentication token.
 
 ## Setup
 
 1. Go to Settings -> Voice Assistants.
 2. Add assistant or edit existing.
-3. Change conversation agent to Oswald
+3. Change conversation agent to Oswald.

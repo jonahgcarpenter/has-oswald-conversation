@@ -1,11 +1,30 @@
 name: Validate
 
 on:
+  pull_request:
+  push:
+    branches: [master]
   release:
     types: [published]
 
 jobs:
+  validate-python:
+    runs-on: "ubuntu-latest"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Compile integration
+        run: python -m compileall -q custom_components
+      - name: Validate JSON
+        run: |
+          python -m json.tool custom_components/oswald_conversation/manifest.json >/dev/null
+          python -m json.tool custom_components/oswald_conversation/strings.json >/dev/null
+          python -m json.tool hacs.json >/dev/null
+
   validate-hacs:
+    if: github.event_name == 'release'
     runs-on: "ubuntu-latest"
     steps:
       - name: HACS validation
