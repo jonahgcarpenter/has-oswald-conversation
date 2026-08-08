@@ -26,6 +26,7 @@ from .protocol import (
 AUTH_TOKEN_SELECTOR = selector.TextSelector(
     selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
 )
+_MASKED_AUTH_TOKEN = "******"
 
 
 class OswaldConversationConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -80,7 +81,13 @@ class OswaldConversationConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         if user_input is not None:
             ws_url = user_input[CONF_WS_URL].strip()
-            auth_token = user_input[CONF_AUTH_TOKEN].strip()
+            submitted_auth_token = user_input.get(CONF_AUTH_TOKEN, "").strip()
+            auth_token = (
+                entry.data[CONF_AUTH_TOKEN]
+                if not submitted_auth_token
+                or submitted_auth_token == _MASKED_AUTH_TOKEN
+                else submitted_auth_token
+            )
             default_user_id = user_input.get(CONF_DEFAULT_USER_ID, "")
 
             if not is_valid_ws_url(ws_url):
@@ -106,6 +113,7 @@ class OswaldConversationConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         schema = await self._async_schema(
             ws_url=entry.data.get(CONF_WS_URL, DEFAULT_WS_URL),
             default_user_id=entry.data.get(CONF_DEFAULT_USER_ID),
+            mask_auth_token=True,
         )
 
         return self.async_show_form(
@@ -119,6 +127,7 @@ class OswaldConversationConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         *,
         ws_url: str,
         default_user_id: str | None = None,
+        mask_auth_token: bool = False,
     ) -> vol.Schema:
         users = [
             user
@@ -142,11 +151,16 @@ class OswaldConversationConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if default_user_id and any(user.id == default_user_id for user in users)
             else vol.Optional(CONF_DEFAULT_USER_ID)
         )
+        auth_token_key = (
+            vol.Optional(CONF_AUTH_TOKEN, default=_MASKED_AUTH_TOKEN)
+            if mask_auth_token
+            else vol.Required(CONF_AUTH_TOKEN)
+        )
 
         return vol.Schema(
             {
                 vol.Required(CONF_WS_URL, default=ws_url): str,
-                vol.Required(CONF_AUTH_TOKEN): AUTH_TOKEN_SELECTOR,
+                auth_token_key: AUTH_TOKEN_SELECTOR,
                 default_user_key: user_selector,
             }
         )
