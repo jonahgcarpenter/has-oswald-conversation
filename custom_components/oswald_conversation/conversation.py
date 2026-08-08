@@ -291,7 +291,6 @@ class OswaldConversationEntity(ConversationEntity):
             "result_text": tool.get("result_text"),
             "duration_ms": tool.get("duration_ms"),
             "is_error": tool.get("is_error", False),
-            "soul": tool.get("soul"),
         }
         state["needs_assistant_role"] = True
         return {
