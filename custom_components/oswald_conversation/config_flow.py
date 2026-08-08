@@ -9,7 +9,13 @@ from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers import selector
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .const import CONF_AUTH_TOKEN, CONF_WS_URL, DEFAULT_WS_URL, DOMAIN
+from .const import (
+    CONF_AUTH_TOKEN,
+    CONF_DEFAULT_USER_ID,
+    CONF_WS_URL,
+    DEFAULT_WS_URL,
+    DOMAIN,
+)
 from .protocol import (
     CONNECTION_TIMEOUT_SECONDS,
     UnsupportedProtocolError,
@@ -31,10 +37,15 @@ class OswaldConversationConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             ws_url = user_input[CONF_WS_URL].strip()
             auth_token = user_input[CONF_AUTH_TOKEN].strip()
+            default_user_id = user_input.get(CONF_DEFAULT_USER_ID, "")
 
             if not is_valid_ws_url(ws_url):
                 errors[CONF_WS_URL] = "invalid_ws_url"
-            else:
+            if default_user_id and not await self._async_valid_default_user(
+                default_user_id
+            ):
+                errors[CONF_DEFAULT_USER_ID] = "invalid_user"
+            if not errors:
                 error = await self._async_validate_connection(ws_url, auth_token)
                 if error is not None:
                     errors["base"] = error
@@ -47,14 +58,12 @@ class OswaldConversationConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         data={
                             CONF_WS_URL: ws_url,
                             CONF_AUTH_TOKEN: auth_token,
+                            CONF_DEFAULT_USER_ID: default_user_id,
                         },
                     )
 
-        schema = vol.Schema(
-            {
-                vol.Required(CONF_WS_URL, default=DEFAULT_WS_URL): str,
-                vol.Required(CONF_AUTH_TOKEN): AUTH_TOKEN_SELECTOR,
-            }
+        schema = await self._async_schema(
+            ws_url=DEFAULT_WS_URL,
         )
 
         return self.async_show_form(
@@ -72,10 +81,15 @@ class OswaldConversationConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             ws_url = user_input[CONF_WS_URL].strip()
             auth_token = user_input[CONF_AUTH_TOKEN].strip()
+            default_user_id = user_input.get(CONF_DEFAULT_USER_ID, "")
 
             if not is_valid_ws_url(ws_url):
                 errors[CONF_WS_URL] = "invalid_ws_url"
-            else:
+            if default_user_id and not await self._async_valid_default_user(
+                default_user_id
+            ):
+                errors[CONF_DEFAULT_USER_ID] = "invalid_user"
+            if not errors:
                 error = await self._async_validate_connection(ws_url, auth_token)
                 if error is not None:
                     errors["base"] = error
@@ -85,17 +99,13 @@ class OswaldConversationConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         data_updates={
                             CONF_WS_URL: ws_url,
                             CONF_AUTH_TOKEN: auth_token,
+                            CONF_DEFAULT_USER_ID: default_user_id,
                         },
                     )
 
-        schema = vol.Schema(
-            {
-                vol.Required(
-                    CONF_WS_URL,
-                    default=entry.data.get(CONF_WS_URL, DEFAULT_WS_URL),
-                ): str,
-                vol.Required(CONF_AUTH_TOKEN): AUTH_TOKEN_SELECTOR,
-            }
+        schema = await self._async_schema(
+            ws_url=entry.data.get(CONF_WS_URL, DEFAULT_WS_URL),
+            default_user_id=entry.data.get(CONF_DEFAULT_USER_ID),
         )
 
         return self.async_show_form(
@@ -103,6 +113,47 @@ class OswaldConversationConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             data_schema=schema,
             errors=errors,
         )
+
+    async def _async_schema(
+        self,
+        *,
+        ws_url: str,
+        default_user_id: str | None = None,
+    ) -> vol.Schema:
+        users = [
+            user
+            for user in await self.hass.auth.async_get_users()
+            if user.is_active and not user.system_generated
+        ]
+        user_selector = selector.SelectSelector(
+            selector.SelectSelectorConfig(
+                options=[
+                    selector.SelectOptionDict(
+                        value=user.id,
+                        label=user.name or "Unnamed user",
+                    )
+                    for user in users
+                ],
+                mode=selector.SelectSelectorMode.DROPDOWN,
+            )
+        )
+        default_user_key = (
+            vol.Optional(CONF_DEFAULT_USER_ID, default=default_user_id)
+            if default_user_id and any(user.id == default_user_id for user in users)
+            else vol.Optional(CONF_DEFAULT_USER_ID)
+        )
+
+        return vol.Schema(
+            {
+                vol.Required(CONF_WS_URL, default=ws_url): str,
+                vol.Required(CONF_AUTH_TOKEN): AUTH_TOKEN_SELECTOR,
+                default_user_key: user_selector,
+            }
+        )
+
+    async def _async_valid_default_user(self, user_id: str) -> bool:
+        user = await self.hass.auth.async_get_user(user_id)
+        return bool(user and user.is_active and not user.system_generated)
 
     async def _async_validate_connection(
         self, ws_url: str, auth_token: str

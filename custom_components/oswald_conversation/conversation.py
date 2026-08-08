@@ -21,7 +21,7 @@ from homeassistant.helpers import intent, llm
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import CONF_AUTH_TOKEN, CONF_WS_URL
+from .const import CONF_AUTH_TOKEN, CONF_DEFAULT_USER_ID, CONF_WS_URL
 from .protocol import REQUEST_TIMEOUT_SECONDS, UnsupportedProtocolError, expect_ready
 
 _LOGGER = logging.getLogger(__name__)
@@ -52,6 +52,7 @@ class OswaldConversationEntity(ConversationEntity):
         self.entry = entry
         self.ws_url = entry.data[CONF_WS_URL]
         self.auth_token = entry.data[CONF_AUTH_TOKEN]
+        self.default_user_id = entry.data.get(CONF_DEFAULT_USER_ID)
         self._attr_unique_id = f"{entry.entry_id}_conversation"
 
     @property
@@ -64,7 +65,7 @@ class OswaldConversationEntity(ConversationEntity):
         chat_log: ChatLog,
     ) -> ConversationResult:
         conversation_id = chat_log.conversation_id
-        if not user_input.context.user_id:
+        if not user_input.context.user_id and not self.default_user_id:
             return self._result(user_input, conversation_id, _MISSING_USER_RESPONSE)
         if not conversation_id:
             return self._result(
@@ -111,12 +112,16 @@ class OswaldConversationEntity(ConversationEntity):
         conversation_id: str,
         state: dict[str, Any],
     ) -> AsyncGenerator[dict[str, Any], None]:
-        user_id = user_input.context.user_id
+        context_user_id = user_input.context.user_id
+        user_id = context_user_id or self.default_user_id
         if user_id is None:
             raise RuntimeError("user identity was not validated")
 
         ha_user = await self.hass.auth.async_get_user(user_id)
-        if ha_user is None:
+        if ha_user is None or (
+            context_user_id is None
+            and (not ha_user.is_active or ha_user.system_generated)
+        ):
             yield {"role": "assistant", "content": _MISSING_USER_RESPONSE}
             state["final_response"] = _MISSING_USER_RESPONSE
             state["streamed_content"] = True
