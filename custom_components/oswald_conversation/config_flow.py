@@ -51,9 +51,6 @@ class OswaldConversationConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 if error is not None:
                     errors["base"] = error
                 else:
-                    await self.async_set_unique_id("oswald_conversation")
-                    self._abort_if_unique_id_configured()
-
                     return self.async_create_entry(
                         title="Oswald Conversation",
                         data={
