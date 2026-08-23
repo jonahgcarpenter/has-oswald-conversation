@@ -3,21 +3,36 @@
     "step": {
       "user": {
         "title": "Oswald Conversation",
-        "description": "Connect Home Assistant Assist to an Oswald AI WebSocket gateway.",
+        "description": "Connect Home Assistant Assist to the authenticated Oswald Home Assistant WebSocket endpoint.",
         "data": {
-          "ws_url": "Oswald WebSocket URL"
+          "ws_url": "Oswald WebSocket URL",
+          "auth_token": "Authentication token",
+          "default_user_id": "Default user for unauthenticated requests (optional)"
+        },
+        "data_description": {
+          "default_user_id": "Requests without an authenticated user, including satellite requests, will assume this user's identity. Only enable this temporary fallback if you trust every device that can access the Assist pipeline."
         }
       },
       "reconfigure": {
         "title": "Reconfigure Oswald Conversation",
-        "description": "Update the Oswald AI WebSocket gateway.",
+        "description": "Update and verify the authenticated Oswald Home Assistant WebSocket endpoint.",
         "data": {
-          "ws_url": "Oswald WebSocket URL"
+          "ws_url": "Oswald WebSocket URL",
+          "auth_token": "Authentication token",
+          "default_user_id": "Default user for unauthenticated requests (optional)"
+        },
+        "data_description": {
+          "auth_token": "Leave the masked value unchanged or clear the field to keep the existing authentication token.",
+          "default_user_id": "Requests without an authenticated user, including satellite requests, will assume this user's identity. Only enable this temporary fallback if you trust every device that can access the Assist pipeline."
         }
       }
     },
     "error": {
-      "invalid_ws_url": "The URL must start with ws:// or wss://"
+      "invalid_ws_url": "Enter a valid ws:// or wss:// URL without credentials or a fragment",
+      "invalid_auth": "The authentication token was rejected",
+      "invalid_user": "Select an active Home Assistant user",
+      "cannot_connect": "Unable to connect to Oswald",
+      "unsupported_protocol": "The endpoint does not support Oswald Home Assistant protocol v1"
     }
   }
 }
