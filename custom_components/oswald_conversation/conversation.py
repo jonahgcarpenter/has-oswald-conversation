@@ -22,7 +22,11 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import CONF_AUTH_TOKEN, CONF_DEFAULT_USER_ID, CONF_WS_URL
-from .protocol import REQUEST_TIMEOUT_SECONDS, UnsupportedProtocolError, expect_ready
+from .protocol import (
+    CONNECTION_TIMEOUT_SECONDS,
+    UnsupportedProtocolError,
+    expect_ready,
+)
 
 _LOGGER = logging.getLogger(__name__)
 _FAILURE_RESPONSE = "I could not reach Oswald."
@@ -141,25 +145,29 @@ class OswaldConversationEntity(ConversationEntity):
         yield {"role": "assistant"}
 
         try:
-            async with asyncio.timeout(REQUEST_TIMEOUT_SECONDS):
-                async with async_get_clientsession(self.hass).ws_connect(
+            async with asyncio.timeout(CONNECTION_TIMEOUT_SECONDS):
+                ws = await async_get_clientsession(self.hass).ws_connect(
                     self.ws_url,
                     headers={"Authorization": f"Bearer {self.auth_token}"},
-                ) as ws:
-                    await expect_ready(ws)
-                    await ws.send_json(payload)
+                    autoping=True,
+                )
+            try:
+                await expect_ready(ws)
+                await ws.send_json(payload)
 
-                    async for msg in ws:
-                        if msg.type != WSMsgType.TEXT:
-                            raise ProtocolFrameError
-                        delta = self._parse_ws_message(msg.data, request_id, state)
-                        if delta is not None:
-                            yield delta
-                        if state["done"]:
-                            break
-
-                    if not state["done"]:
+                async for msg in ws:
+                    if msg.type != WSMsgType.TEXT:
                         raise ProtocolFrameError
+                    delta = self._parse_ws_message(msg.data, request_id, state)
+                    if delta is not None:
+                        yield delta
+                    if state["done"]:
+                        break
+
+                if not state["done"]:
+                    raise ProtocolFrameError
+            finally:
+                await ws.close()
         except (
             ClientError,
             asyncio.TimeoutError,
