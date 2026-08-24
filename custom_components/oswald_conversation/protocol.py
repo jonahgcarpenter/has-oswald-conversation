@@ -10,7 +10,6 @@ from .const import PROTOCOL_VERSION
 
 READY_TIMEOUT_SECONDS = 10
 CONNECTION_TIMEOUT_SECONDS = 10
-REQUEST_TIMEOUT_SECONDS = 240
 
 
 class UnsupportedProtocolError(Exception):
