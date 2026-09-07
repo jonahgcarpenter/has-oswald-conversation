@@ -1,0 +1,5 @@
+# Home Assistant 2026.9.1 and its conversation dependencies.
+pytest-homeassistant-custom-component==0.13.364
+gazetteer-matcher==1.1.0
+hassil==3.12.0
+home-assistant-intents==2026.8.28
