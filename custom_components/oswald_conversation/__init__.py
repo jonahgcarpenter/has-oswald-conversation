@@ -3,11 +3,17 @@ from __future__ import annotations
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed
+
+from .const import CONF_AUTH_TOKEN
 
 PLATFORMS: list[Platform] = [Platform.CONVERSATION]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    if not entry.data.get(CONF_AUTH_TOKEN, "").strip():
+        raise ConfigEntryAuthFailed("An Oswald authentication token is required")
+
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 

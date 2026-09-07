@@ -1,0 +1,4 @@
+# Home Assistant 2026.7.0 and its conversation dependencies.
+pytest-homeassistant-custom-component==0.13.344
+hassil==3.8.0
+home-assistant-intents==2026.6.24

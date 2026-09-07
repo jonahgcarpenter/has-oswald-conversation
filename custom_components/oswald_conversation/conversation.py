@@ -4,10 +4,11 @@ import asyncio
 import json
 import logging
 from collections.abc import AsyncGenerator
+from contextlib import AsyncExitStack
 from typing import Any
 from uuid import uuid4
 
-from aiohttp import ClientError, WSMsgType
+from aiohttp import ClientError, ClientWSTimeout, WSMsgType, WSServerHandshakeError
 from homeassistant.components import conversation
 from homeassistant.components.conversation import (
     ChatLog,
@@ -22,14 +23,18 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import CONF_AUTH_TOKEN, CONF_DEFAULT_USER_ID, CONF_WS_URL
-from .protocol import (
-    CONNECTION_TIMEOUT_SECONDS,
-    UnsupportedProtocolError,
-    expect_ready,
-)
+from .protocol import CONNECTION_TIMEOUT_SECONDS, UnsupportedProtocolError, expect_ready
 
 _LOGGER = logging.getLogger(__name__)
 _FAILURE_RESPONSE = "I could not reach Oswald."
+_INTERRUPTED_RESPONSE = (
+    "The connection to Oswald was interrupted. The request may still be running "
+    "and actions may have completed. Send /stop in this conversation to stop "
+    "active work; do not repeat the request unless you have checked its outcome."
+)
+_AUTH_RESPONSE = (
+    "Oswald rejected the authentication token. Reauthenticate the integration."
+)
 _MISSING_USER_RESPONSE = "Oswald requires an authenticated Home Assistant user."
 _MISSING_CONVERSATION_RESPONSE = "Oswald could not identify this conversation."
 
@@ -78,8 +83,6 @@ class OswaldConversationEntity(ConversationEntity):
 
         state: dict[str, Any] = {
             "final_response": None,
-            "streamed_text": "",
-            "streamed_content": False,
             "done": False,
             "needs_assistant_role": False,
             "pending_tools": [],
@@ -91,9 +94,7 @@ class OswaldConversationEntity(ConversationEntity):
         ):
             pass
 
-        response_text = (
-            state["final_response"] or state["streamed_text"] or _FAILURE_RESPONSE
-        )
+        response_text = state["final_response"] or _FAILURE_RESPONSE
         return self._result(user_input, conversation_id, response_text)
 
     @staticmethod
@@ -128,7 +129,6 @@ class OswaldConversationEntity(ConversationEntity):
         ):
             yield {"role": "assistant", "content": _MISSING_USER_RESPONSE}
             state["final_response"] = _MISSING_USER_RESPONSE
-            state["streamed_content"] = True
             return
         display_name = ha_user.name or "Home Assistant User"
 
@@ -144,16 +144,22 @@ class OswaldConversationEntity(ConversationEntity):
 
         yield {"role": "assistant"}
 
+        submitted = False
         try:
-            async with asyncio.timeout(CONNECTION_TIMEOUT_SECONDS):
-                ws = await async_get_clientsession(self.hass).ws_connect(
-                    self.ws_url,
-                    headers={"Authorization": f"Bearer {self.auth_token}"},
-                    autoping=True,
-                )
-            try:
-                await expect_ready(ws)
-                await ws.send_json(payload)
+            async with AsyncExitStack() as stack:
+                async with asyncio.timeout(CONNECTION_TIMEOUT_SECONDS):
+                    ws = await stack.enter_async_context(
+                        async_get_clientsession(self.hass).ws_connect(
+                            self.ws_url,
+                            headers={"Authorization": f"Bearer {self.auth_token}"},
+                            autoping=True,
+                            timeout=ClientWSTimeout(ws_receive=None, ws_close=10),
+                        )
+                    )
+                    await expect_ready(ws)
+                    # Even a failed send can have reached the server. Never retry it.
+                    submitted = True
+                    await ws.send_json(payload)
 
                 async for msg in ws:
                     if msg.type != WSMsgType.TEXT:
@@ -166,8 +172,6 @@ class OswaldConversationEntity(ConversationEntity):
 
                 if not state["done"]:
                     raise ProtocolFrameError
-            finally:
-                await ws.close()
         except (
             ClientError,
             asyncio.TimeoutError,
@@ -179,16 +183,17 @@ class OswaldConversationEntity(ConversationEntity):
                 "Oswald conversation request failed: error_type=%s",
                 type(err).__name__,
             )
-            state["final_response"] = _FAILURE_RESPONSE
-            state["streamed_content"] = True
-            yield self._assistant_delta(state, "content", _FAILURE_RESPONSE)
-            return
+            if isinstance(err, WSServerHandshakeError) and err.status == 401:
+                self.entry.async_start_reauth(self.hass)
+                state["final_response"] = _AUTH_RESPONSE
+            else:
+                state["final_response"] = (
+                    _INTERRUPTED_RESPONSE if submitted else _FAILURE_RESPONSE
+                )
 
-        if state["streamed_content"]:
-            return
-        if state["final_response"] is not None:
-            state["streamed_content"] = True
-            yield {"content": state["final_response"]}
+        yield self._assistant_delta(
+            state, "content", state["final_response"] or _FAILURE_RESPONSE
+        )
 
     def _parse_ws_message(
         self,
@@ -200,18 +205,24 @@ class OswaldConversationEntity(ConversationEntity):
             data: Any = json.loads(raw)
         except (json.JSONDecodeError, TypeError):
             raise ProtocolFrameError from None
-        if not isinstance(data, dict) or data.get("request_id") != request_id:
+        if not isinstance(data, dict):
             raise ProtocolFrameError
 
         msg_type = data.get("type")
+        if data.get("request_id") != request_id and not (
+            "request_id" not in data
+            and msg_type == "error"
+            and data.get("code") == "invalid_request"
+        ):
+            raise ProtocolFrameError
         if msg_type in {"content", "thinking"}:
             text = data.get("text")
             if not isinstance(text, str) or not text:
                 raise ProtocolFrameError
             if msg_type == "content":
-                state["streamed_text"] += text
-                state["streamed_content"] = True
-                return self._assistant_delta(state, "content", text)
+                # HA deltas are append-only; previews can differ from result.response.
+                # Only the terminal answer is safe to publish to streaming TTS.
+                return None
             return self._assistant_delta(state, "thinking_content", text)
 
         if msg_type == "tool_call":
@@ -237,13 +248,12 @@ class OswaldConversationEntity(ConversationEntity):
                 raise ProtocolFrameError
             state["final_response"] = message
             state["done"] = True
-            state["streamed_content"] = True
-            return self._assistant_delta(state, "content", message)
+            return None
 
         raise ProtocolFrameError
 
     @staticmethod
-    def _assistant_delta(state: dict[str, Any], key: str, value: str) -> dict[str, Any]:
+    def _assistant_delta(state: dict[str, Any], key: str, value: Any) -> dict[str, Any]:
         delta: dict[str, Any] = {key: value}
         if state["needs_assistant_role"]:
             state["needs_assistant_role"] = False
@@ -273,7 +283,7 @@ class OswaldConversationEntity(ConversationEntity):
             external=True,
         )
         state["pending_tools"].append((tool_input.id, tool_name))
-        return {"tool_calls": [tool_input]}
+        return self._assistant_delta(state, "tool_calls", [tool_input])
 
     def _parse_tool_result(
         self,
@@ -305,6 +315,11 @@ class OswaldConversationEntity(ConversationEntity):
             "duration_ms": tool.get("duration_ms"),
             "is_error": tool.get("is_error", False),
         }
+        for key in ("web.search", "web.fetch", "user_memory", "global_memory"):
+            if key in tool:
+                if not isinstance(tool[key], dict):
+                    raise ProtocolFrameError
+                tool_result[key] = tool[key]
         state["needs_assistant_role"] = True
         return {
             "role": "tool_result",

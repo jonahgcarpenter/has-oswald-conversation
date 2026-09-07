@@ -37,7 +37,7 @@ class OswaldConversationConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         if user_input is not None:
             ws_url = user_input[CONF_WS_URL].strip()
-            auth_token = user_input[CONF_AUTH_TOKEN].strip()
+            auth_token = user_input.get(CONF_AUTH_TOKEN, "").strip()
             default_user_id = user_input.get(CONF_DEFAULT_USER_ID, "")
 
             if not is_valid_ws_url(ws_url):
@@ -74,13 +74,14 @@ class OswaldConversationConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self, user_input: dict | None = None
     ) -> FlowResult:
         entry = self._get_reconfigure_entry()
+        existing_auth_token = entry.data.get(CONF_AUTH_TOKEN, "").strip()
         errors: dict[str, str] = {}
 
         if user_input is not None:
             ws_url = user_input[CONF_WS_URL].strip()
             submitted_auth_token = user_input.get(CONF_AUTH_TOKEN, "").strip()
             auth_token = (
-                entry.data[CONF_AUTH_TOKEN]
+                existing_auth_token
                 if not submitted_auth_token
                 or submitted_auth_token == _MASKED_AUTH_TOKEN
                 else submitted_auth_token
@@ -110,12 +111,45 @@ class OswaldConversationConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         schema = await self._async_schema(
             ws_url=entry.data.get(CONF_WS_URL, DEFAULT_WS_URL),
             default_user_id=entry.data.get(CONF_DEFAULT_USER_ID),
-            mask_auth_token=True,
+            mask_auth_token=bool(existing_auth_token),
         )
 
         return self.async_show_form(
             step_id="reconfigure",
             data_schema=schema,
+            errors=errors,
+        )
+
+    async def async_step_reauth(self, entry_data: dict) -> FlowResult:
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self, user_input: dict | None = None
+    ) -> FlowResult:
+        entry = self._get_reauth_entry()
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            auth_token = user_input.get(CONF_AUTH_TOKEN, "").strip()
+            ws_url = entry.data.get(CONF_WS_URL, DEFAULT_WS_URL)
+            if not is_valid_ws_url(ws_url):
+                errors["base"] = "invalid_ws_url"
+            else:
+                error = await self._async_validate_connection(ws_url, auth_token)
+                if error is not None:
+                    errors["base"] = error
+                else:
+                    return self.async_update_reload_and_abort(
+                        entry,
+                        data_updates={CONF_AUTH_TOKEN: auth_token},
+                        reason="reauth_successful",
+                    )
+
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=vol.Schema(
+                {vol.Required(CONF_AUTH_TOKEN): AUTH_TOKEN_SELECTOR}
+            ),
             errors=errors,
         )
 
@@ -144,7 +178,10 @@ class OswaldConversationConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             )
         )
         default_user_key = (
-            vol.Optional(CONF_DEFAULT_USER_ID, default=default_user_id)
+            vol.Optional(
+                CONF_DEFAULT_USER_ID,
+                description={"suggested_value": default_user_id},
+            )
             if default_user_id and any(user.id == default_user_id for user in users)
             else vol.Optional(CONF_DEFAULT_USER_ID)
         )
@@ -169,7 +206,7 @@ class OswaldConversationConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def _async_validate_connection(
         self, ws_url: str, auth_token: str
     ) -> str | None:
-        if not auth_token:
+        if not auth_token or auth_token == _MASKED_AUTH_TOKEN:
             return "invalid_auth"
 
         try:

@@ -20,7 +20,7 @@ def is_valid_ws_url(value: str) -> bool:
     """Return whether value is a structurally valid WebSocket URL."""
     try:
         parsed = urlsplit(value)
-        parsed.port
+        _ = parsed.port  # Access validates malformed or out-of-range ports.
     except ValueError:
         return False
 
