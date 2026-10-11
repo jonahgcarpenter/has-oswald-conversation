@@ -11,6 +11,7 @@ from homeassistant.components import conversation
 from homeassistant.components.conversation import (
     ChatLog,
     ConversationEntity,
+    ConversationEntityFeature,
     ConversationInput,
     ConversationResult,
 )
@@ -73,6 +74,7 @@ async def async_setup_entry(
 class OswaldConversationEntity(ConversationEntity):
     _attr_has_entity_name = True
     _attr_name = "Oswald"
+    _attr_supported_features = ConversationEntityFeature.CONTROL
     _attr_supports_streaming = True
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:

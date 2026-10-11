@@ -6,7 +6,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from aiohttp import ClientError
-from homeassistant.components.conversation import ChatLog, ConversationInput
+from homeassistant.components.conversation import (
+    ChatLog,
+    ConversationEntityFeature,
+    ConversationInput,
+)
 from homeassistant.components.conversation.chat_log import (
     AssistantContent,
     UserContent,
@@ -68,6 +72,12 @@ def entity(hass):
     )
     entry.add_to_hass(hass)
     return OswaldConversationEntity(hass, entry)
+
+
+def test_entity_advertises_home_control(entity):
+    assert (
+        entity.supported_features & ConversationEntityFeature.CONTROL
+    ) == ConversationEntityFeature.CONTROL
 
 
 def content_chunk(text):
