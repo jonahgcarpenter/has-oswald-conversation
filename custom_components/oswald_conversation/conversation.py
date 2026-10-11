@@ -50,7 +50,18 @@ from .client import (
     InvalidResponseError,
     async_stream_chat_completion,
 )
-from .const import CONF_API_KEY, CONF_BASE_URL, CONF_MODEL, DOMAIN
+from .const import (
+    CONF_API_KEY,
+    CONF_BASE_URL,
+    CONF_LLM_HASS_API,
+    CONF_MAX_HISTORY,
+    CONF_MODEL,
+    CONF_PROMPT,
+    DEFAULT_LLM_HASS_API,
+    DEFAULT_MAX_HISTORY,
+    DEFAULT_PROMPT,
+    DOMAIN,
+)
 
 _LOGGER = logging.getLogger(__name__)
 _FAILURE_RESPONSE = "I could not reach Oswald."
@@ -82,7 +93,22 @@ class OswaldConversationEntity(ConversationEntity):
         self.entry = entry
         self.base_url = entry.data[CONF_BASE_URL]
         self.api_key = entry.data[CONF_API_KEY]
-        self.model = entry.data[CONF_MODEL]
+        self.model = entry.options.get(CONF_MODEL) or entry.data.get(CONF_MODEL)
+        self.prompt = entry.options.get(CONF_PROMPT, DEFAULT_PROMPT)
+        configured_apis = entry.options.get(CONF_LLM_HASS_API, DEFAULT_LLM_HASS_API)
+        if isinstance(configured_apis, str):
+            configured_apis = [configured_apis]
+        self.llm_hass_apis = [
+            api_id for api_id in configured_apis if isinstance(api_id, str) and api_id
+        ]
+        try:
+            self.max_history = int(
+                entry.options.get(CONF_MAX_HISTORY, DEFAULT_MAX_HISTORY)
+            )
+        except (TypeError, ValueError):
+            self.max_history = DEFAULT_MAX_HISTORY
+        if self.max_history < 1:
+            self.max_history = DEFAULT_MAX_HISTORY
         self._attr_unique_id = f"{entry.entry_id}_conversation"
 
     @property
@@ -109,7 +135,9 @@ class OswaldConversationEntity(ConversationEntity):
                 device_id=user_input.device_id,
             )
             await chat_log.async_provide_llm_data(
-                llm_context, user_llm_hass_api="assist"
+                llm_context,
+                user_llm_hass_api=self.llm_hass_apis or None,
+                user_llm_prompt=self.prompt or None,
             )
         except HomeAssistantError as err:
             _LOGGER.warning("Oswald could not prepare conversation tools: %s", err)
@@ -121,7 +149,9 @@ class OswaldConversationEntity(ConversationEntity):
 
         try:
             for _ in range(MAX_TOOL_TURNS):
-                messages = self._messages_from_log(chat_log)
+                messages = self._trim_history(
+                    self._messages_from_log(chat_log), self.max_history
+                )
                 tools_param = self._openai_tools(chat_log)
                 payload: dict[str, Any] = {
                     "model": self.model,
@@ -345,6 +375,15 @@ class OswaldConversationEntity(ConversationEntity):
                     }
                 )
         return messages
+
+    @staticmethod
+    def _trim_history(
+        messages: list[dict[str, Any]], max_history: int
+    ) -> list[dict[str, Any]]:
+        """Keep system messages plus the last max_history other messages."""
+        system = [msg for msg in messages if msg.get("role") == "system"]
+        rest = [msg for msg in messages if msg.get("role") != "system"]
+        return system + rest[-max_history:]
 
     @staticmethod
     def _openai_tools(chat_log: ChatLog) -> list[dict[str, Any]]:

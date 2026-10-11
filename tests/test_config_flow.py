@@ -5,7 +5,7 @@ from unittest.mock import patch
 import pytest
 from homeassistant import config_entries
 from homeassistant.const import Platform
-from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.data_entry_flow import FlowResultType, InvalidData
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import selector
 from homeassistant.helpers.translation import async_get_translations
@@ -24,8 +24,13 @@ from custom_components.oswald_conversation.client import (
 from custom_components.oswald_conversation.const import (
     CONF_API_KEY,
     CONF_BASE_URL,
+    CONF_LLM_HASS_API,
+    CONF_MAX_HISTORY,
     CONF_MODEL,
+    CONF_PROMPT,
     DEFAULT_BASE_URL,
+    DEFAULT_MAX_HISTORY,
+    DEFAULT_PROMPT,
     DOMAIN,
 )
 
@@ -307,3 +312,133 @@ async def test_unload_returns_platform_result(hass, success):
     ) as unload:
         assert await async_unload_entry(hass, entry) is success
     unload.assert_awaited_once_with(entry, [Platform.CONVERSATION])
+
+
+OPTIONS_DATA = {
+    CONF_MODEL: MODELS[1],
+    CONF_PROMPT: "Custom instructions.",
+    CONF_LLM_HASS_API: ["assist"],
+    CONF_MAX_HISTORY: 5,
+}
+
+
+def _schema_default(data_schema, key_name):
+    key = next(key for key in data_schema.schema if str(key) == key_name)
+    default = key.default
+    return default() if callable(default) else default
+
+
+async def test_options_flow(hass, list_models):
+    entry = MockConfigEntry(domain=DOMAIN, data={**DATA, CONF_MODEL: MODELS[0]})
+    entry.add_to_hass(hass)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "init"
+    schema = result["data_schema"].schema
+    assert {str(key) for key in schema} == {
+        CONF_MODEL,
+        CONF_PROMPT,
+        CONF_LLM_HASS_API,
+        CONF_MAX_HISTORY,
+    }
+    model_key = next(key for key in schema if str(key) == CONF_MODEL)
+    assert schema[model_key].config["options"] == MODELS
+    assert _schema_default(result["data_schema"], CONF_PROMPT) == DEFAULT_PROMPT
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], OPTIONS_DATA
+    )
+    await hass.async_block_till_done()
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert entry.options[CONF_MODEL] == MODELS[1]
+    assert entry.options[CONF_PROMPT] == "Custom instructions."
+    assert entry.options[CONF_LLM_HASS_API] == ["assist"]
+    assert entry.options[CONF_MAX_HISTORY] == 5
+
+
+async def test_options_flow_defaults_from_entry(hass, list_models):
+    entry = MockConfigEntry(
+        domain=DOMAIN, data={**DATA, CONF_MODEL: MODELS[0]}, options=OPTIONS_DATA
+    )
+    entry.add_to_hass(hass)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    schema = result["data_schema"].schema
+    defaults = {
+        str(key): _schema_default(result["data_schema"], str(key)) for key in schema
+    }
+    assert defaults[CONF_MODEL] == MODELS[1]
+    assert defaults[CONF_PROMPT] == "Custom instructions."
+    assert defaults[CONF_LLM_HASS_API] == ["assist"]
+    assert defaults[CONF_MAX_HISTORY] == 5
+
+
+async def test_options_flow_rejects_unknown_apis(hass, list_models):
+    entry = MockConfigEntry(domain=DOMAIN, data={**DATA, CONF_MODEL: MODELS[0]})
+    entry.add_to_hass(hass)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    # Select validation rejects unknown APIs before the handler runs.
+    with pytest.raises(InvalidData):
+        await hass.config_entries.options.async_configure(
+            result["flow_id"],
+            {**OPTIONS_DATA, CONF_LLM_HASS_API: ["assist", "no-such-api"]},
+        )
+    assert entry.options == {}
+
+
+async def test_options_flow_model_fallback_when_server_down(hass, list_models):
+    list_models.side_effect = ConnectionFailedError()
+    entry = MockConfigEntry(domain=DOMAIN, data={**DATA, CONF_MODEL: MODELS[0]})
+    entry.add_to_hass(hass)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    schema = result["data_schema"].schema
+    model_key = next(key for key in schema if str(key) == CONF_MODEL)
+    assert isinstance(schema[model_key], selector.TextSelector)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {**OPTIONS_DATA, CONF_MODEL: "typed-model"}
+    )
+    await hass.async_block_till_done()
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert entry.options[CONF_MODEL] == "typed-model"
+
+
+async def test_options_flow_rejects_empty_model(hass, list_models):
+    # With the server down the model field falls back to free text,
+    # so blank input reaches the handler instead of schema validation.
+    list_models.side_effect = ConnectionFailedError()
+    entry = MockConfigEntry(domain=DOMAIN, data={**DATA, CONF_MODEL: MODELS[0]})
+    entry.add_to_hass(hass)
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {**OPTIONS_DATA, CONF_MODEL: "  "}
+    )
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {CONF_MODEL: "empty_model"}
+    assert entry.options == {}
+
+
+async def test_options_update_reloads_entry(hass):
+    entry = MockConfigEntry(domain=DOMAIN, data={**DATA, CONF_MODEL: MODELS[0]})
+    entry.add_to_hass(hass)
+    with patch.object(hass.config_entries, "async_forward_entry_setups"):
+        assert await async_setup_entry(hass, entry)
+    with patch.object(hass.config_entries, "async_reload", return_value=True) as reload:
+        hass.config_entries.async_update_entry(
+            entry, options={**OPTIONS_DATA, CONF_MAX_HISTORY: DEFAULT_MAX_HISTORY}
+        )
+        await hass.async_block_till_done()
+    reload.assert_awaited_once_with(entry.entry_id)
+
+
+async def test_options_translations_load(hass):
+    translations = await async_get_translations(hass, "en", "options", {DOMAIN})
+    prefix = f"component.{DOMAIN}.options"
+    assert translations[f"{prefix}.step.init.data.model"] == "Model"
+    assert translations[f"{prefix}.step.init.data.prompt"] == "Instructions"
+    assert (
+        translations[f"{prefix}.step.init.data.llm_hass_api"]
+        == "Control Home Assistant"
+    )
+    assert (
+        translations[f"{prefix}.step.init.data.max_history_messages"]
+        == "Max history messages"
+    )

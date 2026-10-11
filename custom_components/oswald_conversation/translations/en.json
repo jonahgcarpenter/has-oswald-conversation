@@ -47,11 +47,32 @@
       "invalid_url": "Enter a valid http:// or https:// base URL",
       "invalid_auth": "Enter a valid API key; the key is missing or was rejected",
       "cannot_connect": "Unable to connect to Oswald",
-      "no_models": "Oswald returned no models"
+      "no_models": "Oswald returned no models",
+      "empty_model": "Select or enter a model",
+      "invalid_max_history": "Enter a number of 1 or more"
     },
     "abort": {
       "reauth_successful": "Authentication was successful.",
       "reconfigure_successful": "Configuration was updated successfully."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Oswald Conversation",
+        "description": "Configure the Oswald conversation agent.",
+        "data": {
+          "model": "Model",
+          "prompt": "Instructions",
+          "llm_hass_api": "Control Home Assistant",
+          "max_history_messages": "Max history messages"
+        },
+        "data_description": {
+          "prompt": "Instruct how the LLM should respond. This can be a template.",
+          "llm_hass_api": "Select the Home Assistant APIs the LLM can use to control your home. Deselect all to disable control.",
+          "max_history_messages": "Maximum number of past messages sent to the model, excluding the system prompt."
+        }
+      }
     }
   }
 }
