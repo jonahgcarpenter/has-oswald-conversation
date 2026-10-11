@@ -267,10 +267,27 @@ async def test_exposed_entity_visible_to_get_live_context(
     assert not async_should_expose(hass, "conversation.oswald", entry.entity_id)
     assert async_should_expose(hass, "conversation", entry.entity_id)
 
-    behaviors, _ = chat_peer
-    behaviors.append(
-        [tool_call_chunk("homeassistant__GetLiveContext", "{}"), stop_chunk()]
+    # Tool naming differs by HA version (namespaced on newer releases),
+    # so discover the live-context tool instead of hardcoding it.
+    from homeassistant.helpers import llm
+
+    api = await llm.async_get_api(
+        hass,
+        "assist",
+        llm.LLMContext(
+            platform=DOMAIN,
+            context=user_input.context,
+            language=user_input.language,
+            assistant="conversation",
+            device_id=user_input.device_id,
+        ),
     )
+    tool_name = next(
+        tool.name for tool in api.tools if tool.name.endswith("GetLiveContext")
+    )
+
+    behaviors, _ = chat_peer
+    behaviors.append([tool_call_chunk(tool_name, "{}"), stop_chunk()])
     behaviors.append([content_chunk("The kitchen light is on."), stop_chunk()])
     result, chat_log, _ = await converse(hass, entity, user_input)
     assert speech(result) == "The kitchen light is on."
