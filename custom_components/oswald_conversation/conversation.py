@@ -56,12 +56,14 @@ from .const import (
     CONF_LLM_HASS_API,
     CONF_MAX_HISTORY,
     CONF_MODEL,
+    CONF_OSWALD_TOOLS,
     CONF_PROMPT,
     DEFAULT_LLM_HASS_API,
     DEFAULT_MAX_HISTORY,
     DEFAULT_PROMPT,
     DOMAIN,
 )
+from .tools import BUILTIN_TOOL_NAMES, DEFAULT_OSWALD_TOOLS, builtin_definitions
 
 _LOGGER = logging.getLogger(__name__)
 _FAILURE_RESPONSE = "I could not reach Oswald."
@@ -109,6 +111,14 @@ class OswaldConversationEntity(ConversationEntity):
             self.max_history = DEFAULT_MAX_HISTORY
         if self.max_history < 1:
             self.max_history = DEFAULT_MAX_HISTORY
+        configured_builtins = entry.options.get(CONF_OSWALD_TOOLS, DEFAULT_OSWALD_TOOLS)
+        if isinstance(configured_builtins, str):
+            configured_builtins = [configured_builtins]
+        self.oswald_tools = [
+            name
+            for name in configured_builtins
+            if isinstance(name, str) and name in BUILTIN_TOOL_NAMES
+        ]
         self._attr_unique_id = f"{entry.entry_id}_conversation"
 
     @property
@@ -144,6 +154,7 @@ class OswaldConversationEntity(ConversationEntity):
             return self._result(user_input, conversation_id, _FAILURE_RESPONSE)
 
         initial_length = len(chat_log.content)
+        received_any = False
         progress_any = False
         response_text = _FAILURE_RESPONSE
 
@@ -152,7 +163,9 @@ class OswaldConversationEntity(ConversationEntity):
                 messages = self._trim_history(
                     self._messages_from_log(chat_log), self.max_history
                 )
-                tools_param = self._openai_tools(chat_log)
+                tools_param = self._openai_tools(chat_log) + builtin_definitions(
+                    self.oswald_tools
+                )
                 payload: dict[str, Any] = {
                     "model": self.model,
                     "messages": messages,
@@ -161,7 +174,7 @@ class OswaldConversationEntity(ConversationEntity):
                 if tools_param:
                     payload["tools"] = tools_param
 
-                turn_state = {"progress": False}
+                turn_state = {"received": False, "progress": False}
 
                 try:
                     async for _content in chat_log.async_add_delta_content_stream(
@@ -170,6 +183,8 @@ class OswaldConversationEntity(ConversationEntity):
                     ):
                         pass
                 finally:
+                    if turn_state["received"]:
+                        received_any = True
                     if turn_state["progress"]:
                         progress_any = True
 
@@ -202,17 +217,25 @@ class OswaldConversationEntity(ConversationEntity):
             if err.status is not None:
                 # The server answered with an error; report its message.
                 response_text = err.message
-            elif progress_any or len(chat_log.content) > initial_length:
+            elif received_any or len(chat_log.content) > initial_length:
                 response_text = _INTERRUPTED_RESPONSE
             else:
                 response_text = _FAILURE_RESPONSE
         except (
             ConnectionFailedError,
-            InvalidResponseError,
             ClientError,
             asyncio.TimeoutError,
             OSError,
         ) as err:
+            _LOGGER.warning(
+                "Oswald conversation request failed: error_type=%s",
+                type(err).__name__,
+            )
+            if received_any or len(chat_log.content) > initial_length:
+                response_text = _INTERRUPTED_RESPONSE
+            else:
+                response_text = _FAILURE_RESPONSE
+        except InvalidResponseError as err:
             _LOGGER.warning(
                 "Oswald conversation request failed: error_type=%s",
                 type(err).__name__,
@@ -271,6 +294,7 @@ class OswaldConversationEntity(ConversationEntity):
         async for chunk in async_stream_chat_completion(
             session, self.base_url, self.api_key, payload
         ):
+            state["received"] = True
             choices = chunk.get("choices")
             if not isinstance(choices, list):
                 raise InvalidResponseError("Missing choices")
@@ -285,6 +309,9 @@ class OswaldConversationEntity(ConversationEntity):
                     yielded_any = True
                     state["progress"] = True
                     yield {"content": content}
+                reasoning = delta.get("reasoning_content")
+                if isinstance(reasoning, str) and reasoning:
+                    yield {"thinking_content": reasoning}
                 tool_calls = delta.get("tool_calls", [])
                 if not isinstance(tool_calls, list):
                     raise InvalidResponseError("Invalid tool calls")

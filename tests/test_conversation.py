@@ -30,6 +30,7 @@ from custom_components.oswald_conversation.const import (
     CONF_LLM_HASS_API,
     CONF_MAX_HISTORY,
     CONF_MODEL,
+    CONF_OSWALD_TOOLS,
     CONF_PROMPT,
     DEFAULT_BASE_URL,
     DOMAIN,
@@ -41,6 +42,7 @@ from custom_components.oswald_conversation.conversation import (
     _MISSING_CONVERSATION_RESPONSE,
     OswaldConversationEntity,
 )
+from custom_components.oswald_conversation.tools import BUILTIN_TOOL_NAMES
 
 MODULE = "custom_components.oswald_conversation.conversation"
 BASE_URL = DEFAULT_BASE_URL
@@ -352,7 +354,8 @@ async def test_options_override_model_prompt_apis_and_history(
     assert len(calls) == 1
     payload = calls[0]["payload"]
     assert payload["model"] == "custom-model"
-    assert "tools" not in payload
+    tools = {tool["function"]["name"] for tool in payload["tools"]}
+    assert tools == BUILTIN_TOOL_NAMES
     assert payload["messages"][0]["role"] == "system"
     assert "Custom instructions XYZ." in payload["messages"][0]["content"]
     rest = payload["messages"][1:]
@@ -389,3 +392,52 @@ def test_trim_history_keeps_system_and_tail():
     trimmed = OswaldConversationEntity._trim_history(messages, 2)
     assert trimmed == [messages[0], messages[2], messages[3]]
     assert OswaldConversationEntity._trim_history(messages, 10) == messages
+
+
+def reasoning_chunk(text):
+    return {"choices": [{"delta": {"reasoning_content": text}, "finish_reason": None}]}
+
+
+async def test_builtin_tools_advertised_by_default(hass, entity, user_input, chat_peer):
+    behaviors, calls = chat_peer
+    behaviors.append([content_chunk("Hi."), stop_chunk()])
+    result, _, _ = await converse(hass, entity, user_input)
+    assert speech(result) == "Hi."
+    tools = {tool["function"]["name"] for tool in calls[0]["payload"]["tools"]}
+    assert {
+        "web_search",
+        "vision_analyze",
+        "session_search",
+        "memory",
+        "image_generate",
+    } <= tools
+    assert any(name.endswith("GetDateTime") for name in tools)
+
+
+async def test_builtin_tools_subset_honored(hass, user_input, chat_peer):
+    entity = options_entity(hass, {CONF_OSWALD_TOOLS: ["memory"]})
+    behaviors, calls = chat_peer
+    behaviors.append([content_chunk("Hi."), stop_chunk()])
+    await converse(hass, entity, user_input)
+    tools = {tool["function"]["name"] for tool in calls[0]["payload"]["tools"]}
+    assert "memory" in tools
+    assert "web_search" not in tools
+
+
+async def test_reasoning_content_becomes_thinking(hass, entity, user_input, chat_peer):
+    behaviors, calls = chat_peer
+    behaviors.append(
+        [reasoning_chunk("Considering."), content_chunk("Answer."), stop_chunk()]
+    )
+    result, chat_log, deltas = await converse(hass, entity, user_input)
+    assert speech(result) == "Answer."
+    assert chat_log.content[-1].thinking_content == "Considering."
+    assert chat_log.content[-1].content == "Answer."
+    assert "".join(delta.get("content", "") for delta in deltas) == "Answer."
+
+
+async def test_reasoning_only_response_is_failure(hass, entity, user_input, chat_peer):
+    behaviors, _ = chat_peer
+    behaviors.append([reasoning_chunk("Considering."), stop_chunk()])
+    result, _, _ = await converse(hass, entity, user_input)
+    assert speech(result) == _FAILURE_RESPONSE

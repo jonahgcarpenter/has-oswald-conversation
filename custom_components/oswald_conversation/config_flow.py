@@ -24,12 +24,18 @@ from .const import (
     CONF_LLM_HASS_API,
     CONF_MAX_HISTORY,
     CONF_MODEL,
+    CONF_OSWALD_TOOLS,
     CONF_PROMPT,
     DEFAULT_BASE_URL,
     DEFAULT_LLM_HASS_API,
     DEFAULT_MAX_HISTORY,
     DEFAULT_PROMPT,
     DOMAIN,
+)
+from .tools import (
+    BUILTIN_TOOL_NAMES,
+    DEFAULT_OSWALD_TOOLS,
+    OSWALD_BUILTIN_TOOLS,
 )
 
 API_KEY_SELECTOR = selector.TextSelector(
@@ -255,6 +261,11 @@ class OswaldConversationOptionsFlow(config_entries.OptionsFlow):
         current_max_history: int = entry.options.get(
             CONF_MAX_HISTORY, DEFAULT_MAX_HISTORY
         )
+        current_builtin_tools: list[str] = [
+            name
+            for name in entry.options.get(CONF_OSWALD_TOOLS, DEFAULT_OSWALD_TOOLS)
+            if isinstance(name, str) and name in BUILTIN_TOOL_NAMES
+        ]
 
         if user_input is not None:
             current_model = str(user_input.get(CONF_MODEL, "")).strip()
@@ -263,6 +274,11 @@ class OswaldConversationOptionsFlow(config_entries.OptionsFlow):
                 api_id
                 for api_id in user_input.get(CONF_LLM_HASS_API, [])
                 if api_id in apis
+            ]
+            current_builtin_tools = [
+                name
+                for name in user_input.get(CONF_OSWALD_TOOLS, [])
+                if name in BUILTIN_TOOL_NAMES
             ]
             try:
                 current_max_history = int(user_input.get(CONF_MAX_HISTORY, 0))
@@ -280,6 +296,7 @@ class OswaldConversationOptionsFlow(config_entries.OptionsFlow):
                         CONF_PROMPT: current_prompt,
                         CONF_LLM_HASS_API: current_apis,
                         CONF_MAX_HISTORY: current_max_history,
+                        CONF_OSWALD_TOOLS: current_builtin_tools,
                     },
                 )
 
@@ -324,6 +341,19 @@ class OswaldConversationOptionsFlow(config_entries.OptionsFlow):
                             max=200,
                             step=1,
                             mode=selector.NumberSelectorMode.BOX,
+                        )
+                    ),
+                    vol.Required(
+                        CONF_OSWALD_TOOLS, default=current_builtin_tools
+                    ): selector.SelectSelector(
+                        selector.SelectSelectorConfig(
+                            options=[
+                                selector.SelectOptionDict(
+                                    value=tool.name, label=tool.label
+                                )
+                                for tool in OSWALD_BUILTIN_TOOLS
+                            ],
+                            multiple=True,
                         )
                     ),
                 }

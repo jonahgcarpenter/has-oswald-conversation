@@ -27,12 +27,14 @@ from custom_components.oswald_conversation.const import (
     CONF_LLM_HASS_API,
     CONF_MAX_HISTORY,
     CONF_MODEL,
+    CONF_OSWALD_TOOLS,
     CONF_PROMPT,
     DEFAULT_BASE_URL,
     DEFAULT_MAX_HISTORY,
     DEFAULT_PROMPT,
     DOMAIN,
 )
+from custom_components.oswald_conversation.tools import DEFAULT_OSWALD_TOOLS
 
 pytestmark = pytest.mark.asyncio
 
@@ -319,6 +321,7 @@ OPTIONS_DATA = {
     CONF_PROMPT: "Custom instructions.",
     CONF_LLM_HASS_API: ["assist"],
     CONF_MAX_HISTORY: 5,
+    CONF_OSWALD_TOOLS: ["web_search", "memory"],
 }
 
 
@@ -340,10 +343,15 @@ async def test_options_flow(hass, list_models):
         CONF_PROMPT,
         CONF_LLM_HASS_API,
         CONF_MAX_HISTORY,
+        CONF_OSWALD_TOOLS,
     }
     model_key = next(key for key in schema if str(key) == CONF_MODEL)
     assert schema[model_key].config["options"] == MODELS
     assert _schema_default(result["data_schema"], CONF_PROMPT) == DEFAULT_PROMPT
+    assert (
+        _schema_default(result["data_schema"], CONF_OSWALD_TOOLS)
+        == DEFAULT_OSWALD_TOOLS
+    )
 
     result = await hass.config_entries.options.async_configure(
         result["flow_id"], OPTIONS_DATA
@@ -354,6 +362,7 @@ async def test_options_flow(hass, list_models):
     assert entry.options[CONF_PROMPT] == "Custom instructions."
     assert entry.options[CONF_LLM_HASS_API] == ["assist"]
     assert entry.options[CONF_MAX_HISTORY] == 5
+    assert entry.options[CONF_OSWALD_TOOLS] == ["web_search", "memory"]
 
 
 async def test_options_flow_defaults_from_entry(hass, list_models):
@@ -370,6 +379,7 @@ async def test_options_flow_defaults_from_entry(hass, list_models):
     assert defaults[CONF_PROMPT] == "Custom instructions."
     assert defaults[CONF_LLM_HASS_API] == ["assist"]
     assert defaults[CONF_MAX_HISTORY] == 5
+    assert defaults[CONF_OSWALD_TOOLS] == ["web_search", "memory"]
 
 
 async def test_options_flow_rejects_unknown_apis(hass, list_models):
@@ -442,3 +452,4 @@ async def test_options_translations_load(hass):
         translations[f"{prefix}.step.init.data.max_history_messages"]
         == "Max history messages"
     )
+    assert translations[f"{prefix}.step.init.data.oswald_tools"] == "Oswald tools"

@@ -6,6 +6,7 @@ CONF_MODEL = "model"
 CONF_PROMPT = "prompt"
 CONF_LLM_HASS_API = "llm_hass_api"
 CONF_MAX_HISTORY = "max_history_messages"
+CONF_OSWALD_TOOLS = "oswald_tools"
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8080/v1"
 DEFAULT_PROMPT = (
