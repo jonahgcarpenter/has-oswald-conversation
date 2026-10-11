@@ -3,47 +3,51 @@
     "step": {
       "user": {
         "title": "Oswald Conversation",
-        "description": "Connect Home Assistant Assist to the authenticated Oswald Home Assistant WebSocket endpoint.",
+        "description": "Connect Home Assistant Assist to Oswald through its OpenAI-compatible API.",
         "data": {
-          "ws_url": "Oswald WebSocket URL",
-          "auth_token": "Authentication token",
-          "default_user_id": "Default user for unauthenticated requests (optional)"
+          "base_url": "Base URL",
+          "api_key": "API key"
         },
         "data_description": {
-          "auth_token": "Use the token configured on the Oswald server. Bearer tokens are sent without encryption over ws://; use wss:// unless the connection is on a trusted network.",
-          "default_user_id": "Requests without an authenticated user, including satellite requests, will assume this user's identity. Only enable this temporary fallback if you trust every device that can access the Assist pipeline."
+          "base_url": "The Oswald OpenAI-compatible base URL, for example http://127.0.0.1:8080/v1.",
+          "api_key": "The API key configured on the Oswald server."
+        }
+      },
+      "model": {
+        "title": "Select model",
+        "description": "Choose the Oswald model for this assistant. Models are listed from {base_url}.",
+        "data": {
+          "model": "Model"
         }
       },
       "reconfigure": {
         "title": "Reconfigure Oswald Conversation",
-        "description": "Update and verify the authenticated Oswald Home Assistant WebSocket endpoint.",
+        "description": "Update and verify the Oswald OpenAI-compatible base URL and API key.",
         "data": {
-          "ws_url": "Oswald WebSocket URL",
-          "auth_token": "Authentication token",
-          "default_user_id": "Default user for unauthenticated requests (optional)"
+          "base_url": "Base URL",
+          "api_key": "API key"
         },
         "data_description": {
-          "auth_token": "Leave the masked value unchanged or clear the field to keep an existing token. If no token is stored, enter one. Bearer tokens are sent without encryption over ws://; use wss:// unless the connection is on a trusted network.",
-          "default_user_id": "Requests without an authenticated user, including satellite requests, will assume this user's identity. Only enable this temporary fallback if you trust every device that can access the Assist pipeline."
+          "base_url": "The Oswald OpenAI-compatible base URL, for example http://127.0.0.1:8080/v1.",
+          "api_key": "Leave the masked value unchanged to keep the stored key, or enter a new one."
         }
       },
       "reauth_confirm": {
         "title": "Authenticate Oswald Conversation",
-        "description": "Enter the token configured on the Oswald server. Older entries without a token must authenticate before they can be used. If the endpoint URL has changed, reconfigure the integration instead.",
+        "description": "Enter the API key configured on the Oswald server at {base_url}.",
         "data": {
-          "auth_token": "Authentication token"
+          "api_key": "API key"
         },
         "data_description": {
-          "auth_token": "Enter a new token; blank or masked values cannot be used for reauthentication. Bearer tokens are sent without encryption over ws://; use wss:// unless the connection is on a trusted network."
+          "api_key": "Enter a new API key; blank or masked values cannot be used for reauthentication."
         }
       }
     },
     "error": {
-      "invalid_ws_url": "Enter a valid ws:// or wss:// URL without credentials or a fragment",
-      "invalid_auth": "Enter a valid authentication token; the token is missing or was rejected",
-      "invalid_user": "Select an active Home Assistant user",
+      "invalid_url": "Enter a valid http:// or https:// base URL",
+      "invalid_auth": "Enter a valid API key; the key is missing or was rejected",
       "cannot_connect": "Unable to connect to Oswald",
-      "unsupported_protocol": "The endpoint does not support Oswald Home Assistant protocol v1"
+      "no_models": "Oswald returned no models"
     },
     "abort": {
       "reauth_successful": "Authentication was successful.",
