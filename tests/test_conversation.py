@@ -780,3 +780,46 @@ async def test_garbage_tool_args_are_failure(hass, entity, user_input, chat_peer
     behaviors.append([tool_call_chunk(tool_name, "not-json{{{"), stop_chunk()])
     result, _, _ = await converse(hass, entity, user_input)
     assert speech(result) == _FAILURE_RESPONSE
+
+
+def oswald_chunk(entries):
+    return {"choices": [{"delta": {"oswald_tool_calls": entries}, "finish_reason": None}]}
+
+
+async def test_oswald_timeline_renders_as_thinking_details(
+    hass, entity, user_input, chat_peer
+):
+    behaviors, _ = chat_peer
+    behaviors.append(
+        [
+            oswald_chunk(
+                [
+                    {"name": "session_search", "phase": "call",
+                     "arguments": {"query": "lights"}},
+                    {"name": "session_search", "phase": "result",
+                     "result_text": "no results"},
+                ]
+            ),
+            content_chunk("Checked."),
+            stop_chunk(),
+        ]
+    )
+    result, chat_log, deltas = await converse(hass, entity, user_input)
+    assert speech(result) == "Checked."
+    thinking = "".join(delta.get("thinking_content", "") for delta in deltas)
+    assert "oswald__session_search" in thinking
+    assert "lights" in thinking
+    assert "no results" in thinking
+    # Server-side entries never become executable HA tool calls.
+    assert chat_log.content[-1].tool_calls == []
+    assert "oswald__session_search" in (chat_log.content[-1].thinking_content or "")
+
+
+async def test_oswald_timeline_invalid_shape_rejected(
+    hass, entity, user_input, chat_peer
+):
+    behaviors, _ = chat_peer
+    behaviors.append([oswald_chunk("not-a-list"), stop_chunk()])
+    result, chat_log, _ = await converse(hass, entity, user_input)
+    assert speech(result) != ""
+    assert len(chat_log.content) > 1

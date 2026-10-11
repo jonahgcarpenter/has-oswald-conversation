@@ -1,7 +1,8 @@
 """Oswald server-side built-in tools.
 
 These tools execute inside the Oswald agent loop; their calls and results
-never appear on the wire (content-only streaming). They are opt-in per
+stream via the `oswald_tool_calls` delta extension and render as
+thinking details (never as HA tool calls). They are opt-in per
 request via the ``tool_choice`` allow-list — never default. Only the names
 in ``SERVER_OFFERABLE_TOOLS`` may be listed; anything else (including
 ``image_generate`` and unknown names) makes the server reject the request

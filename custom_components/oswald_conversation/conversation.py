@@ -121,6 +121,58 @@ def _parse_tool_args(raw_arguments: str) -> dict[str, Any]:
     }
 
 
+_OSWALD_TOOL_NAME_RE = __import__("re").compile(r"^[A-Za-z0-9_.-]{1,128}$")
+_OSWALD_TOOL_TEXT_LIMIT = 2000
+
+
+def _format_oswald_tool_entry(entry: Any) -> str | None:
+    """Format one server-side tool timeline entry as details markdown.
+
+    The server streams builtin/MCP activity via the ``oswald_tool_calls``
+    delta extension; it must never become HA ``ToolInput`` (HA cannot
+    execute server-side tools). Rendering as ``thinking_content`` feeds the
+    frontend "Show details" dropdown, mirroring the Ollama integration.
+    """
+    if not isinstance(entry, dict):
+        return None
+    name = entry.get("name")
+    phase = entry.get("phase")
+    if (
+        not isinstance(name, str)
+        or not _OSWALD_TOOL_NAME_RE.match(name)
+        or phase not in ("call", "result")
+    ):
+        return None
+    if phase == "call":
+        arguments = entry.get("arguments", {})
+        if arguments is None:
+            arguments = {}
+        if not isinstance(arguments, dict):
+            return None
+        try:
+            encoded = json.dumps(arguments, ensure_ascii=False, indent=2)
+        except (TypeError, ValueError):
+            return None
+        if len(encoded) > _OSWALD_TOOL_TEXT_LIMIT:
+            encoded = encoded[:_OSWALD_TOOL_TEXT_LIMIT] + "\u2026"
+        return f"\n\n`oswald__{name}`\n```json\n{encoded}\n```\n"
+    result = entry.get("result_text", "")
+    if not isinstance(result, str):
+        return None
+    if len(result) > _OSWALD_TOOL_TEXT_LIMIT:
+        result = result[:_OSWALD_TOOL_TEXT_LIMIT] + "\u2026"
+    truncated = entry.get("result_truncated") is True and result.endswith("\u2026")
+    _ = truncated
+    if entry.get("is_error") is True:
+        return f"\n\n`oswald__{name}` failed\n```\n{result}\n```\n"
+    web_search = entry.get("web_search")
+    if isinstance(web_search, dict):
+        query = web_search.get("query")
+        if isinstance(query, str) and query and query not in result:
+            return f"\n\n`oswald__{name}`\n```\n{result}\n```\n"
+    return f"\n\n`oswald__{name}`\n```\n{result}\n```\n"
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -374,6 +426,18 @@ class OswaldConversationEntity(ConversationEntity):
                     yielded_any = True
                     state["progress"] = True
                     yield {"thinking_content": reasoning}
+                oswald_calls = delta.get("oswald_tool_calls", [])
+                if oswald_calls:
+                    if not isinstance(oswald_calls, list):
+                        raise InvalidResponseError("Invalid oswald tool calls")
+                    for oswald_entry in oswald_calls:
+                        if not isinstance(oswald_entry, dict):
+                            raise InvalidResponseError("Invalid oswald tool entry")
+                        formatted = _format_oswald_tool_entry(oswald_entry)
+                        if formatted:
+                            yielded_any = True
+                            state["progress"] = True
+                            yield {"thinking_content": formatted}
                 tool_calls = delta.get("tool_calls", [])
                 if not isinstance(tool_calls, list):
                     raise InvalidResponseError("Invalid tool calls")
