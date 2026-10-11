@@ -529,12 +529,17 @@ class OswaldConversationEntity(ConversationEntity):
                 ):
                     messages.append(message)
             elif isinstance(item, ToolResultContent):
+                # .result exists on newer HA; fall back to the deprecated
+                # .tool_result on older versions (removed in HA 2027.11).
+                tool_data = (
+                    item.result.data if hasattr(item, "result") else item.tool_result
+                )
                 messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": item.tool_call_id,
                         "content": json.dumps(
-                            item.tool_result, ensure_ascii=False, default=str
+                            tool_data, ensure_ascii=False, default=str
                         ),
                     }
                 )

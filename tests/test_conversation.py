@@ -295,11 +295,17 @@ async def test_exposed_entity_visible_to_get_live_context(
         item for item in chat_log.content if isinstance(item, ToolResultContent)
     ]
     assert len(tool_results) == 1
-    assert tool_results[0].tool_result["success"] is True
-    assert "error" not in tool_results[0].tool_result
+    # .result exists on newer HA; older versions only have .tool_result.
+    tool_data = (
+        tool_results[0].result.data
+        if hasattr(tool_results[0], "result")
+        else tool_results[0].tool_result
+    )
+    assert tool_data["success"] is True
+    assert "error" not in tool_data
     # The exposed light is what the tool saw.
-    assert "domain: light" in tool_results[0].tool_result["result"]
-    assert "state: 'on'" in tool_results[0].tool_result["result"]
+    assert "domain: light" in tool_data["result"]
+    assert "state: 'on'" in tool_data["result"]
 
 
 async def test_rejected_key_starts_reauth(hass, entity, user_input, chat_peer):
@@ -783,7 +789,9 @@ async def test_garbage_tool_args_are_failure(hass, entity, user_input, chat_peer
 
 
 def oswald_chunk(entries):
-    return {"choices": [{"delta": {"oswald_tool_calls": entries}, "finish_reason": None}]}
+    return {
+        "choices": [{"delta": {"oswald_tool_calls": entries}, "finish_reason": None}]
+    }
 
 
 async def test_oswald_timeline_renders_as_thinking_details(
@@ -794,10 +802,16 @@ async def test_oswald_timeline_renders_as_thinking_details(
         [
             oswald_chunk(
                 [
-                    {"name": "session_search", "phase": "call",
-                     "arguments": {"query": "lights"}},
-                    {"name": "session_search", "phase": "result",
-                     "result_text": "no results"},
+                    {
+                        "name": "session_search",
+                        "phase": "call",
+                        "arguments": {"query": "lights"},
+                    },
+                    {
+                        "name": "session_search",
+                        "phase": "result",
+                        "result_text": "no results",
+                    },
                 ]
             ),
             content_chunk("Checked."),
@@ -810,8 +824,9 @@ async def test_oswald_timeline_renders_as_thinking_details(
     assert "oswald__session_search" in thinking
     assert "lights" in thinking
     assert "no results" in thinking
-    # Server-side entries never become executable HA tool calls.
-    assert chat_log.content[-1].tool_calls == []
+    # Server-side entries never become executable HA tool calls
+    # (core stores an empty list as None).
+    assert not chat_log.content[-1].tool_calls
     assert "oswald__session_search" in (chat_log.content[-1].thinking_content or "")
 
 
