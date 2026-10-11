@@ -5,8 +5,9 @@ import asyncio
 import voluptuous as vol
 from aiohttp import ClientError
 from homeassistant import config_entries
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.data_entry_flow import FlowResult
-from homeassistant.helpers import selector
+from homeassistant.helpers import llm, selector
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .client import (
@@ -17,12 +18,54 @@ from .client import (
     is_valid_base_url,
     normalize_base_url,
 )
-from .const import CONF_API_KEY, CONF_BASE_URL, CONF_MODEL, DEFAULT_BASE_URL, DOMAIN
+from .const import (
+    CONF_API_KEY,
+    CONF_BASE_URL,
+    CONF_LLM_HASS_API,
+    CONF_MAX_HISTORY,
+    CONF_MODEL,
+    CONF_PROMPT,
+    DEFAULT_BASE_URL,
+    DEFAULT_LLM_HASS_API,
+    DEFAULT_MAX_HISTORY,
+    DEFAULT_PROMPT,
+    DOMAIN,
+)
 
 API_KEY_SELECTOR = selector.TextSelector(
     selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
 )
+PROMPT_SELECTOR = selector.TextSelector(selector.TextSelectorConfig(multiline=True))
 _MASKED_API_KEY = "******"
+
+
+async def _fetch_models(
+    hass: HomeAssistant, base_url: str, api_key: str
+) -> tuple[list[str], str | None]:
+    if not is_valid_base_url(base_url):
+        return [], "invalid_url"
+    if not api_key or api_key == _MASKED_API_KEY:
+        return [], "invalid_auth"
+
+    try:
+        async with asyncio.timeout(15):
+            models = await async_list_models(
+                async_get_clientsession(hass), base_url, api_key
+            )
+    except InvalidAuthError:
+        return [], "invalid_auth"
+    except (
+        ConnectionFailedError,
+        InvalidResponseError,
+        ClientError,
+        asyncio.TimeoutError,
+        OSError,
+    ):
+        return [], "cannot_connect"
+
+    if not models:
+        return [], "no_models"
+    return models, None
 
 
 class OswaldConversationConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -33,6 +76,13 @@ class OswaldConversationConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._api_key: str | None = None
         self._models: list[str] = []
         self._is_reconfigure = False
+
+    @staticmethod
+    @callback
+    def async_get_options_flow(
+        config_entry: config_entries.ConfigEntry,
+    ) -> config_entries.OptionsFlow:
+        return OswaldConversationOptionsFlow()
 
     async def async_step_user(self, user_input: dict | None = None) -> FlowResult:
         errors: dict[str, str] = {}
@@ -186,27 +236,97 @@ class OswaldConversationConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def _async_fetch_models(
         self, base_url: str, api_key: str
     ) -> tuple[list[str], str | None]:
-        if not is_valid_base_url(base_url):
-            return [], "invalid_url"
-        if not api_key or api_key == _MASKED_API_KEY:
-            return [], "invalid_auth"
+        return await _fetch_models(self.hass, base_url, api_key)
 
-        try:
-            async with asyncio.timeout(15):
-                models = await async_list_models(
-                    async_get_clientsession(self.hass), base_url, api_key
+
+class OswaldConversationOptionsFlow(config_entries.OptionsFlow):
+    async def async_step_init(self, user_input: dict | None = None) -> FlowResult:
+        entry = self.config_entry
+        errors: dict[str, str] = {}
+
+        apis = {api.id: api.name for api in llm.async_get_apis(self.hass)}
+        current_model = entry.options.get(CONF_MODEL) or entry.data.get(CONF_MODEL, "")
+        current_prompt = entry.options.get(CONF_PROMPT, DEFAULT_PROMPT)
+        current_apis = [
+            api_id
+            for api_id in entry.options.get(CONF_LLM_HASS_API, DEFAULT_LLM_HASS_API)
+            if isinstance(api_id, str) and api_id in apis
+        ]
+        current_max_history: int = entry.options.get(
+            CONF_MAX_HISTORY, DEFAULT_MAX_HISTORY
+        )
+
+        if user_input is not None:
+            current_model = str(user_input.get(CONF_MODEL, "")).strip()
+            current_prompt = str(user_input.get(CONF_PROMPT, ""))
+            current_apis = [
+                api_id
+                for api_id in user_input.get(CONF_LLM_HASS_API, [])
+                if api_id in apis
+            ]
+            try:
+                current_max_history = int(user_input.get(CONF_MAX_HISTORY, 0))
+            except (TypeError, ValueError):
+                current_max_history = 0
+            if not current_model:
+                errors[CONF_MODEL] = "empty_model"
+            elif current_max_history < 1:
+                errors[CONF_MAX_HISTORY] = "invalid_max_history"
+            else:
+                return self.async_create_entry(
+                    title="",
+                    data={
+                        CONF_MODEL: current_model,
+                        CONF_PROMPT: current_prompt,
+                        CONF_LLM_HASS_API: current_apis,
+                        CONF_MAX_HISTORY: current_max_history,
+                    },
                 )
-        except InvalidAuthError:
-            return [], "invalid_auth"
-        except (
-            ConnectionFailedError,
-            InvalidResponseError,
-            ClientError,
-            asyncio.TimeoutError,
-            OSError,
-        ):
-            return [], "cannot_connect"
 
-        if not models:
-            return [], "no_models"
-        return models, None
+        base_url = normalize_base_url(entry.data.get(CONF_BASE_URL, ""))
+        api_key = entry.data.get(CONF_API_KEY, "").strip()
+        fetched, _ = await _fetch_models(self.hass, base_url, api_key)
+        models = fetched or None
+
+        if models:
+            model_selector = selector.SelectSelector(
+                selector.SelectSelectorConfig(
+                    options=models,
+                    mode=selector.SelectSelectorMode.DROPDOWN,
+                )
+            )
+        else:
+            # Server unreachable: fall back to a free text field.
+            model_selector = selector.TextSelector(selector.TextSelectorConfig())
+
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_MODEL, default=current_model): model_selector,
+                    vol.Required(CONF_PROMPT, default=current_prompt): PROMPT_SELECTOR,
+                    vol.Required(
+                        CONF_LLM_HASS_API, default=current_apis
+                    ): selector.SelectSelector(
+                        selector.SelectSelectorConfig(
+                            options=[
+                                selector.SelectOptionDict(value=api_id, label=name)
+                                for api_id, name in sorted(apis.items())
+                            ],
+                            multiple=True,
+                        )
+                    ),
+                    vol.Required(
+                        CONF_MAX_HISTORY, default=current_max_history
+                    ): selector.NumberSelector(
+                        selector.NumberSelectorConfig(
+                            min=1,
+                            max=200,
+                            step=1,
+                            mode=selector.NumberSelectorMode.BOX,
+                        )
+                    ),
+                }
+            ),
+            errors=errors,
+        )

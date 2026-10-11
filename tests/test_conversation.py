@@ -27,7 +27,10 @@ from custom_components.oswald_conversation.client import (
 from custom_components.oswald_conversation.const import (
     CONF_API_KEY,
     CONF_BASE_URL,
+    CONF_LLM_HASS_API,
+    CONF_MAX_HISTORY,
     CONF_MODEL,
+    CONF_PROMPT,
     DEFAULT_BASE_URL,
     DOMAIN,
 )
@@ -307,3 +310,82 @@ async def test_handshake_error_is_failure(hass, entity, user_input, chat_peer):
     behaviors.append(WSServerHandshakeError(MagicMock(), (), status=401))
     result, _, _ = await converse(hass, entity, user_input)
     assert speech(result) == _FAILURE_RESPONSE
+
+
+def options_entity(hass, options):
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={CONF_BASE_URL: BASE_URL, CONF_API_KEY: "test-key", CONF_MODEL: MODEL},
+        options=options,
+    )
+    entry.add_to_hass(hass)
+    return OswaldConversationEntity(hass, entry)
+
+
+async def test_options_override_model_prompt_apis_and_history(
+    hass, user_input, chat_peer
+):
+    entity = options_entity(
+        hass,
+        {
+            CONF_MODEL: "custom-model",
+            CONF_PROMPT: "Custom instructions XYZ.",
+            CONF_LLM_HASS_API: [],
+            CONF_MAX_HISTORY: 2,
+        },
+    )
+    behaviors, calls = chat_peer
+    behaviors.append([content_chunk("Hi."), stop_chunk()])
+
+    chat_log = ChatLog(hass, user_input.conversation_id)
+    for index in range(3):
+        chat_log.async_add_user_content(UserContent(content=f"old question {index}"))
+        chat_log.async_add_assistant_content_without_tools(
+            AssistantContent(
+                agent_id="conversation.oswald", content=f"old answer {index}"
+            )
+        )
+    chat_log.async_add_user_content(UserContent(content=user_input.text))
+    result = await entity._async_handle_message(user_input, chat_log)
+
+    assert speech(result) == "Hi."
+    assert len(calls) == 1
+    payload = calls[0]["payload"]
+    assert payload["model"] == "custom-model"
+    assert "tools" not in payload
+    assert payload["messages"][0]["role"] == "system"
+    assert "Custom instructions XYZ." in payload["messages"][0]["content"]
+    rest = payload["messages"][1:]
+    assert len(rest) == 2
+    assert rest[-1] == {"role": "user", "content": "Hello"}
+    assert rest[0] == {"role": "assistant", "content": "old answer 2"}
+
+
+async def test_options_invalid_values_fall_back_to_defaults(
+    hass, user_input, chat_peer
+):
+    entity = options_entity(
+        hass,
+        {CONF_PROMPT: "", CONF_LLM_HASS_API: "assist", CONF_MAX_HISTORY: 0},
+    )
+    assert entity.model == MODEL
+    assert entity.llm_hass_apis == ["assist"]
+    assert entity.max_history == 20
+
+    behaviors, calls = chat_peer
+    behaviors.append([content_chunk("Hi."), stop_chunk()])
+    result, _, _ = await converse(hass, entity, user_input)
+    assert speech(result) == "Hi."
+    assert "tools" in calls[0]["payload"]
+
+
+def test_trim_history_keeps_system_and_tail():
+    messages = [
+        {"role": "system", "content": "prompt"},
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "two"},
+        {"role": "user", "content": "three"},
+    ]
+    trimmed = OswaldConversationEntity._trim_history(messages, 2)
+    assert trimmed == [messages[0], messages[2], messages[3]]
+    assert OswaldConversationEntity._trim_history(messages, 10) == messages
