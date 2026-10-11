@@ -63,7 +63,7 @@ from .const import (
     DEFAULT_PROMPT,
     DOMAIN,
 )
-from .tools import BUILTIN_TOOL_NAMES, DEFAULT_OSWALD_TOOLS, builtin_definitions
+from .tools import DEFAULT_OSWALD_TOOLS, offerable_builtin_names
 
 _LOGGER = logging.getLogger(__name__)
 _FAILURE_RESPONSE = "I could not reach Oswald."
@@ -114,11 +114,11 @@ class OswaldConversationEntity(ConversationEntity):
         configured_builtins = entry.options.get(CONF_OSWALD_TOOLS, DEFAULT_OSWALD_TOOLS)
         if isinstance(configured_builtins, str):
             configured_builtins = [configured_builtins]
-        self.oswald_tools = [
-            name
-            for name in configured_builtins
-            if isinstance(name, str) and name in BUILTIN_TOOL_NAMES
-        ]
+        # Only names the server offers may be listed; anything else
+        # (including image_generate) would make the server reject the turn.
+        self.oswald_tools = offerable_builtin_names(
+            [name for name in configured_builtins if isinstance(name, str)]
+        )
         self._attr_unique_id = f"{entry.entry_id}_conversation"
 
     @property
@@ -163,9 +163,7 @@ class OswaldConversationEntity(ConversationEntity):
                 messages = self._trim_history(
                     self._messages_from_log(chat_log), self.max_history
                 )
-                tools_param = self._openai_tools(chat_log) + builtin_definitions(
-                    self.oswald_tools
-                )
+                tools_param = self._openai_tools(chat_log)
                 payload: dict[str, Any] = {
                     "model": self.model,
                     "messages": messages,
@@ -173,6 +171,20 @@ class OswaldConversationEntity(ConversationEntity):
                 }
                 if tools_param:
                     payload["tools"] = tools_param
+                if self.oswald_tools:
+                    # Opt the server builtins in; name-only refs, mode auto.
+                    # Rebuilt every turn (including tool-result continuations).
+                    payload["tool_choice"] = {
+                        "type": "allowed_tools",
+                        "allowed_tools": {
+                            "mode": "auto",
+                            "tools": [
+                                {"type": "function", "function": {"name": name}}
+                                for name in [t["function"]["name"] for t in tools_param]
+                                + self.oswald_tools
+                            ],
+                        },
+                    }
 
                 turn_state = {"received": False, "progress": False}
 

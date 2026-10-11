@@ -354,8 +354,20 @@ async def test_options_override_model_prompt_apis_and_history(
     assert len(calls) == 1
     payload = calls[0]["payload"]
     assert payload["model"] == "custom-model"
-    tools = {tool["function"]["name"] for tool in payload["tools"]}
-    assert tools == BUILTIN_TOOL_NAMES
+    tools = {tool["function"]["name"] for tool in payload.get("tools", [])}
+    assert tools.isdisjoint(BUILTIN_TOOL_NAMES | {"image_generate"})
+    choice = payload["tool_choice"]
+    assert choice["type"] == "allowed_tools"
+    assert choice["allowed_tools"]["mode"] == "auto"
+    allowed = [item["function"]["name"] for item in choice["allowed_tools"]["tools"]]
+    assert allowed == [
+        tool["function"]["name"] for tool in payload.get("tools", [])
+    ] + [
+        "memory",
+        "session_search",
+        "web_search",
+        "vision_analyze",
+    ]
     assert payload["messages"][0]["role"] == "system"
     assert "Custom instructions XYZ." in payload["messages"][0]["content"]
     rest = payload["messages"][1:]
@@ -403,15 +415,19 @@ async def test_builtin_tools_advertised_by_default(hass, entity, user_input, cha
     behaviors.append([content_chunk("Hi."), stop_chunk()])
     result, _, _ = await converse(hass, entity, user_input)
     assert speech(result) == "Hi."
-    tools = {tool["function"]["name"] for tool in calls[0]["payload"]["tools"]}
-    assert {
-        "web_search",
-        "vision_analyze",
-        "session_search",
-        "memory",
-        "image_generate",
-    } <= tools
+    payload = calls[0]["payload"]
+    # tools carries HA tool schemas only — no builtin schemas are duplicated.
+    tools = {tool["function"]["name"] for tool in payload["tools"]}
+    assert tools.isdisjoint(BUILTIN_TOOL_NAMES | {"image_generate"})
     assert any(name.endswith("GetDateTime") for name in tools)
+    # Opt-in travels via the tool_choice allow-list instead.
+    choice = payload["tool_choice"]
+    assert choice["type"] == "allowed_tools"
+    assert choice["allowed_tools"]["mode"] == "auto"
+    allowed = {item["function"]["name"] for item in choice["allowed_tools"]["tools"]}
+    assert BUILTIN_TOOL_NAMES <= allowed
+    assert "image_generate" not in allowed
+    assert tools <= allowed
 
 
 async def test_builtin_tools_subset_honored(hass, user_input, chat_peer):
@@ -419,9 +435,64 @@ async def test_builtin_tools_subset_honored(hass, user_input, chat_peer):
     behaviors, calls = chat_peer
     behaviors.append([content_chunk("Hi."), stop_chunk()])
     await converse(hass, entity, user_input)
-    tools = {tool["function"]["name"] for tool in calls[0]["payload"]["tools"]}
-    assert "memory" in tools
-    assert "web_search" not in tools
+    payload = calls[0]["payload"]
+    tools = {tool["function"]["name"] for tool in payload["tools"]}
+    assert "memory" not in tools
+    allowed = {
+        item["function"]["name"]
+        for item in payload["tool_choice"]["allowed_tools"]["tools"]
+    }
+    assert "memory" in allowed
+    assert "web_search" not in allowed
+    assert "image_generate" not in allowed
+    assert tools <= allowed
+
+
+async def test_unofferable_names_never_listed(hass, user_input, chat_peer):
+    entity = options_entity(
+        hass, {CONF_OSWALD_TOOLS: ["memory", "image_generate", "no-such-tool"]}
+    )
+    assert entity.oswald_tools == ["memory"]
+    behaviors, calls = chat_peer
+    behaviors.append([content_chunk("Hi."), stop_chunk()])
+    await converse(hass, entity, user_input)
+    allowed = [
+        item["function"]["name"]
+        for item in calls[0]["payload"]["tool_choice"]["allowed_tools"]["tools"]
+    ]
+    assert "memory" in allowed
+    assert "image_generate" not in allowed
+    assert "no-such-tool" not in allowed
+
+
+async def test_no_builtin_opt_in_omits_tool_choice(hass, user_input, chat_peer):
+    entity = options_entity(hass, {CONF_OSWALD_TOOLS: []})
+    behaviors, calls = chat_peer
+    behaviors.append([content_chunk("Hi."), stop_chunk()])
+    await converse(hass, entity, user_input)
+    assert "tool_choice" not in calls[0]["payload"]
+    assert "tools" in calls[0]["payload"]
+
+
+async def test_tool_choice_repeated_on_continuation(
+    hass, entity, user_input, chat_peer
+):
+    tool_name = await assist_tool_name(hass, user_input, "GetDateTime")
+    behaviors, calls = chat_peer
+    behaviors.append([tool_call_chunk(tool_name, "{}"), stop_chunk()])
+    behaviors.append([content_chunk("Done."), stop_chunk()])
+    await converse(hass, entity, user_input)
+    assert len(calls) == 2
+    first = [
+        item["function"]["name"]
+        for item in calls[0]["payload"]["tool_choice"]["allowed_tools"]["tools"]
+    ]
+    second = [
+        item["function"]["name"]
+        for item in calls[1]["payload"]["tool_choice"]["allowed_tools"]["tools"]
+    ]
+    assert first == second
+    assert "memory" in first
 
 
 async def test_reasoning_content_becomes_thinking(hass, entity, user_input, chat_peer):
