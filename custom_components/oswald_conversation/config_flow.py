@@ -3,120 +3,151 @@ from __future__ import annotations
 import asyncio
 
 import voluptuous as vol
-from aiohttp import ClientError, WSServerHandshakeError
+from aiohttp import ClientError
 from homeassistant import config_entries
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers import selector
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .const import (
-    CONF_AUTH_TOKEN,
-    CONF_DEFAULT_USER_ID,
-    CONF_WS_URL,
-    DEFAULT_WS_URL,
-    DOMAIN,
+from .client import (
+    ConnectionFailedError,
+    InvalidAuthError,
+    InvalidResponseError,
+    async_list_models,
+    is_valid_base_url,
+    normalize_base_url,
 )
-from .protocol import (
-    CONNECTION_TIMEOUT_SECONDS,
-    UnsupportedProtocolError,
-    expect_ready,
-    is_valid_ws_url,
-)
+from .const import CONF_API_KEY, CONF_BASE_URL, CONF_MODEL, DEFAULT_BASE_URL, DOMAIN
 
-AUTH_TOKEN_SELECTOR = selector.TextSelector(
+API_KEY_SELECTOR = selector.TextSelector(
     selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
 )
-_MASKED_AUTH_TOKEN = "******"
+_MASKED_API_KEY = "******"
 
 
 class OswaldConversationConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
-    VERSION = 1
+    VERSION = 2
+
+    def __init__(self) -> None:
+        self._base_url: str | None = None
+        self._api_key: str | None = None
+        self._models: list[str] = []
+        self._is_reconfigure = False
 
     async def async_step_user(self, user_input: dict | None = None) -> FlowResult:
         errors: dict[str, str] = {}
+        base_url = DEFAULT_BASE_URL
+        api_key: str | None = None
 
         if user_input is not None:
-            ws_url = user_input[CONF_WS_URL].strip()
-            auth_token = user_input.get(CONF_AUTH_TOKEN, "").strip()
-            default_user_id = user_input.get(CONF_DEFAULT_USER_ID, "")
-
-            if not is_valid_ws_url(ws_url):
-                errors[CONF_WS_URL] = "invalid_ws_url"
-            if default_user_id and not await self._async_valid_default_user(
-                default_user_id
-            ):
-                errors[CONF_DEFAULT_USER_ID] = "invalid_user"
-            if not errors:
-                error = await self._async_validate_connection(ws_url, auth_token)
-                if error is not None:
-                    errors["base"] = error
+            base_url = normalize_base_url(user_input.get(CONF_BASE_URL, ""))
+            api_key = user_input.get(CONF_API_KEY, "").strip()
+            models, error = await self._async_fetch_models(base_url, api_key)
+            if error is not None:
+                if error == "invalid_url":
+                    errors[CONF_BASE_URL] = error
                 else:
-                    return self.async_create_entry(
-                        title="Oswald Conversation",
-                        data={
-                            CONF_WS_URL: ws_url,
-                            CONF_AUTH_TOKEN: auth_token,
-                            CONF_DEFAULT_USER_ID: default_user_id,
-                        },
-                    )
-
-        schema = await self._async_schema(
-            ws_url=DEFAULT_WS_URL,
-        )
+                    errors["base"] = error
+            else:
+                self._base_url = base_url
+                self._api_key = api_key
+                self._models = models
+                return await self.async_step_model()
 
         return self.async_show_form(
             step_id="user",
-            data_schema=schema,
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_BASE_URL, default=base_url): str,
+                    vol.Required(CONF_API_KEY, default=api_key or ""): API_KEY_SELECTOR,
+                }
+            ),
             errors=errors,
+        )
+
+    async def async_step_model(self, user_input: dict | None = None) -> FlowResult:
+        if self._base_url is None or self._api_key is None or not self._models:
+            return await self.async_step_user()
+
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            model = user_input.get(CONF_MODEL, "")
+            if self._is_reconfigure:
+                entry = self._get_reconfigure_entry()
+                return self.async_update_reload_and_abort(
+                    entry,
+                    data_updates={
+                        CONF_BASE_URL: self._base_url,
+                        CONF_API_KEY: self._api_key,
+                        CONF_MODEL: model,
+                    },
+                )
+            else:
+                return self.async_create_entry(
+                    title="Oswald Conversation",
+                    data={
+                        CONF_BASE_URL: self._base_url,
+                        CONF_API_KEY: self._api_key,
+                        CONF_MODEL: model,
+                    },
+                )
+
+        return self.async_show_form(
+            step_id="model",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_MODEL): selector.SelectSelector(
+                        selector.SelectSelectorConfig(
+                            options=self._models,
+                            mode=selector.SelectSelectorMode.DROPDOWN,
+                        )
+                    )
+                }
+            ),
+            errors=errors,
+            description_placeholders={"base_url": self._base_url},
         )
 
     async def async_step_reconfigure(
         self, user_input: dict | None = None
     ) -> FlowResult:
         entry = self._get_reconfigure_entry()
-        existing_auth_token = entry.data.get(CONF_AUTH_TOKEN, "").strip()
+        existing_api_key = entry.data.get(CONF_API_KEY, "").strip()
+        self._is_reconfigure = True
         errors: dict[str, str] = {}
+        base_url = entry.data.get(CONF_BASE_URL, DEFAULT_BASE_URL)
 
         if user_input is not None:
-            ws_url = user_input[CONF_WS_URL].strip()
-            submitted_auth_token = user_input.get(CONF_AUTH_TOKEN, "").strip()
-            auth_token = (
-                existing_auth_token
-                if not submitted_auth_token
-                or submitted_auth_token == _MASKED_AUTH_TOKEN
-                else submitted_auth_token
+            base_url = normalize_base_url(user_input.get(CONF_BASE_URL, ""))
+            submitted_api_key = user_input.get(CONF_API_KEY, "").strip()
+            api_key = (
+                existing_api_key
+                if not submitted_api_key or submitted_api_key == _MASKED_API_KEY
+                else submitted_api_key
             )
-            default_user_id = user_input.get(CONF_DEFAULT_USER_ID, "")
-
-            if not is_valid_ws_url(ws_url):
-                errors[CONF_WS_URL] = "invalid_ws_url"
-            if default_user_id and not await self._async_valid_default_user(
-                default_user_id
-            ):
-                errors[CONF_DEFAULT_USER_ID] = "invalid_user"
-            if not errors:
-                error = await self._async_validate_connection(ws_url, auth_token)
-                if error is not None:
-                    errors["base"] = error
+            models, error = await self._async_fetch_models(base_url, api_key)
+            if error is not None:
+                if error == "invalid_url":
+                    errors[CONF_BASE_URL] = error
                 else:
-                    return self.async_update_reload_and_abort(
-                        entry,
-                        data_updates={
-                            CONF_WS_URL: ws_url,
-                            CONF_AUTH_TOKEN: auth_token,
-                            CONF_DEFAULT_USER_ID: default_user_id,
-                        },
-                    )
-
-        schema = await self._async_schema(
-            ws_url=entry.data.get(CONF_WS_URL, DEFAULT_WS_URL),
-            default_user_id=entry.data.get(CONF_DEFAULT_USER_ID),
-            mask_auth_token=bool(existing_auth_token),
-        )
+                    errors["base"] = error
+            else:
+                self._base_url = base_url
+                self._api_key = api_key
+                self._models = models
+                return await self.async_step_model()
 
         return self.async_show_form(
             step_id="reconfigure",
-            data_schema=schema,
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_BASE_URL, default=base_url): str,
+                    vol.Optional(
+                        CONF_API_KEY,
+                        default=_MASKED_API_KEY if existing_api_key else "",
+                    ): API_KEY_SELECTOR,
+                }
+            ),
             errors=errors,
         )
 
@@ -128,101 +159,54 @@ class OswaldConversationConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     ) -> FlowResult:
         entry = self._get_reauth_entry()
         errors: dict[str, str] = {}
+        base_url = normalize_base_url(entry.data.get(CONF_BASE_URL, ""))
 
         if user_input is not None:
-            auth_token = user_input.get(CONF_AUTH_TOKEN, "").strip()
-            ws_url = entry.data.get(CONF_WS_URL, DEFAULT_WS_URL)
-            if not is_valid_ws_url(ws_url):
-                errors["base"] = "invalid_ws_url"
+            api_key = user_input.get(CONF_API_KEY, "").strip()
+            if not is_valid_base_url(base_url):
+                errors["base"] = "invalid_url"
             else:
-                error = await self._async_validate_connection(ws_url, auth_token)
+                _, error = await self._async_fetch_models(base_url, api_key)
                 if error is not None:
                     errors["base"] = error
                 else:
                     return self.async_update_reload_and_abort(
                         entry,
-                        data_updates={CONF_AUTH_TOKEN: auth_token},
+                        data_updates={CONF_API_KEY: api_key},
                         reason="reauth_successful",
                     )
 
         return self.async_show_form(
             step_id="reauth_confirm",
-            data_schema=vol.Schema(
-                {vol.Required(CONF_AUTH_TOKEN): AUTH_TOKEN_SELECTOR}
-            ),
+            data_schema=vol.Schema({vol.Required(CONF_API_KEY): API_KEY_SELECTOR}),
             errors=errors,
+            description_placeholders={"base_url": base_url},
         )
 
-    async def _async_schema(
-        self,
-        *,
-        ws_url: str,
-        default_user_id: str | None = None,
-        mask_auth_token: bool = False,
-    ) -> vol.Schema:
-        users = [
-            user
-            for user in await self.hass.auth.async_get_users()
-            if user.is_active and not user.system_generated
-        ]
-        user_selector = selector.SelectSelector(
-            selector.SelectSelectorConfig(
-                options=[
-                    selector.SelectOptionDict(
-                        value=user.id,
-                        label=user.name or "Unnamed user",
-                    )
-                    for user in users
-                ],
-                mode=selector.SelectSelectorMode.DROPDOWN,
-            )
-        )
-        default_user_key = (
-            vol.Optional(
-                CONF_DEFAULT_USER_ID,
-                description={"suggested_value": default_user_id},
-            )
-            if default_user_id and any(user.id == default_user_id for user in users)
-            else vol.Optional(CONF_DEFAULT_USER_ID)
-        )
-        auth_token_key = (
-            vol.Optional(CONF_AUTH_TOKEN, default=_MASKED_AUTH_TOKEN)
-            if mask_auth_token
-            else vol.Required(CONF_AUTH_TOKEN)
-        )
-
-        return vol.Schema(
-            {
-                vol.Required(CONF_WS_URL, default=ws_url): str,
-                auth_token_key: AUTH_TOKEN_SELECTOR,
-                default_user_key: user_selector,
-            }
-        )
-
-    async def _async_valid_default_user(self, user_id: str) -> bool:
-        user = await self.hass.auth.async_get_user(user_id)
-        return bool(user and user.is_active and not user.system_generated)
-
-    async def _async_validate_connection(
-        self, ws_url: str, auth_token: str
-    ) -> str | None:
-        if not auth_token or auth_token == _MASKED_AUTH_TOKEN:
-            return "invalid_auth"
+    async def _async_fetch_models(
+        self, base_url: str, api_key: str
+    ) -> tuple[list[str], str | None]:
+        if not is_valid_base_url(base_url):
+            return [], "invalid_url"
+        if not api_key or api_key == _MASKED_API_KEY:
+            return [], "invalid_auth"
 
         try:
-            async with asyncio.timeout(CONNECTION_TIMEOUT_SECONDS):
-                async with async_get_clientsession(self.hass).ws_connect(
-                    ws_url,
-                    headers={"Authorization": f"Bearer {auth_token}"},
-                ) as ws:
-                    await expect_ready(ws)
-        except WSServerHandshakeError as err:
-            if err.status == 401:
-                return "invalid_auth"
-            return "cannot_connect"
-        except UnsupportedProtocolError:
-            return "unsupported_protocol"
-        except (ClientError, asyncio.TimeoutError, OSError):
-            return "cannot_connect"
+            async with asyncio.timeout(15):
+                models = await async_list_models(
+                    async_get_clientsession(self.hass), base_url, api_key
+                )
+        except InvalidAuthError:
+            return [], "invalid_auth"
+        except (
+            ConnectionFailedError,
+            InvalidResponseError,
+            ClientError,
+            asyncio.TimeoutError,
+            OSError,
+        ):
+            return [], "cannot_connect"
 
-        return None
+        if not models:
+            return [], "no_models"
+        return models, None

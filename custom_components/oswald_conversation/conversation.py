@@ -4,11 +4,9 @@ import asyncio
 import json
 import logging
 from collections.abc import AsyncGenerator
-from contextlib import AsyncExitStack
 from typing import Any
-from uuid import uuid4
 
-from aiohttp import ClientError, ClientWSTimeout, WSMsgType, WSServerHandshakeError
+from aiohttp import ClientError
 from homeassistant.components import conversation
 from homeassistant.components.conversation import (
     ChatLog,
@@ -16,31 +14,52 @@ from homeassistant.components.conversation import (
     ConversationInput,
     ConversationResult,
 )
+from homeassistant.components.conversation.chat_log import (
+    AssistantContent,
+    SystemContent,
+    ToolResultContent,
+    UserContent,
+)
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import intent, llm
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import CONF_AUTH_TOKEN, CONF_DEFAULT_USER_ID, CONF_WS_URL
-from .protocol import CONNECTION_TIMEOUT_SECONDS, UnsupportedProtocolError, expect_ready
+try:  # Home Assistant >= 2026.9 exposes probatio instead of voluptuous_openapi.
+    from probatio import to_openapi as _schema_to_openapi_impl
+
+    def _schema_to_openapi(schema: Any, custom_serializer: Any = None) -> Any:
+        return _schema_to_openapi_impl(schema, custom_serializer=custom_serializer)
+
+except ImportError:  # Home Assistant <= 2026.8 uses voluptuous_openapi.
+    from voluptuous_openapi import convert as _schema_to_openapi_impl_legacy
+
+    def _schema_to_openapi(schema: Any, custom_serializer: Any = None) -> Any:
+        return _schema_to_openapi_impl_legacy(
+            schema, custom_serializer=custom_serializer
+        )
+
+
+from .client import (
+    ChatCompletionError,
+    ConnectionFailedError,
+    InvalidAuthError,
+    InvalidResponseError,
+    async_stream_chat_completion,
+)
+from .const import CONF_API_KEY, CONF_BASE_URL, CONF_MODEL, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 _FAILURE_RESPONSE = "I could not reach Oswald."
 _INTERRUPTED_RESPONSE = (
-    "The connection to Oswald was interrupted. The request may still be running "
-    "and actions may have completed. Send /stop in this conversation to stop "
-    "active work; do not repeat the request unless you have checked its outcome."
+    "The connection to Oswald was interrupted before it finished answering."
 )
-_AUTH_RESPONSE = (
-    "Oswald rejected the authentication token. Reauthenticate the integration."
-)
-_MISSING_USER_RESPONSE = "Oswald requires an authenticated Home Assistant user."
+_AUTH_RESPONSE = "Oswald rejected the API key. Reauthenticate the integration."
 _MISSING_CONVERSATION_RESPONSE = "Oswald could not identify this conversation."
 
-
-class ProtocolFrameError(Exception):
-    """Raised when an Oswald response frame violates protocol v1."""
+MAX_TOOL_TURNS = 10
 
 
 async def async_setup_entry(
@@ -59,9 +78,9 @@ class OswaldConversationEntity(ConversationEntity):
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         self.hass = hass
         self.entry = entry
-        self.ws_url = entry.data[CONF_WS_URL]
-        self.auth_token = entry.data[CONF_AUTH_TOKEN]
-        self.default_user_id = entry.data.get(CONF_DEFAULT_USER_ID)
+        self.base_url = entry.data[CONF_BASE_URL]
+        self.api_key = entry.data[CONF_API_KEY]
+        self.model = entry.data[CONF_MODEL]
         self._attr_unique_id = f"{entry.entry_id}_conversation"
 
     @property
@@ -74,27 +93,118 @@ class OswaldConversationEntity(ConversationEntity):
         chat_log: ChatLog,
     ) -> ConversationResult:
         conversation_id = chat_log.conversation_id
-        if not user_input.context.user_id and not self.default_user_id:
-            return self._result(user_input, conversation_id, _MISSING_USER_RESPONSE)
         if not conversation_id:
             return self._result(
                 user_input, conversation_id, _MISSING_CONVERSATION_RESPONSE
             )
 
-        state: dict[str, Any] = {
-            "final_response": None,
-            "done": False,
-            "needs_assistant_role": False,
-            "pending_tools": [],
-        }
+        try:
+            llm_context = llm.LLMContext(
+                platform=DOMAIN,
+                context=user_input.context,
+                language=user_input.language,
+                assistant=user_input.agent_id,
+                device_id=user_input.device_id,
+            )
+            await chat_log.async_provide_llm_data(
+                llm_context, user_llm_hass_api="assist"
+            )
+        except HomeAssistantError as err:
+            _LOGGER.warning("Oswald could not prepare conversation tools: %s", err)
+            return self._result(user_input, conversation_id, _FAILURE_RESPONSE)
+
+        initial_length = len(chat_log.content)
+        progress_any = False
+        response_text = _FAILURE_RESPONSE
+
+        try:
+            for _ in range(MAX_TOOL_TURNS):
+                messages = self._messages_from_log(chat_log)
+                tools_param = self._openai_tools(chat_log)
+                payload: dict[str, Any] = {
+                    "model": self.model,
+                    "messages": messages,
+                    "stream": True,
+                }
+                if tools_param:
+                    payload["tools"] = tools_param
+
+                turn_state = {"progress": False}
+
+                try:
+                    async for _content in chat_log.async_add_delta_content_stream(
+                        user_input.agent_id,
+                        self._stream_turn(payload, turn_state),
+                    ):
+                        pass
+                finally:
+                    if turn_state["progress"]:
+                        progress_any = True
+
+                last = chat_log.content[-1]
+                if isinstance(last, ToolResultContent):
+                    # Tools ran; ask Oswald for a follow-up answer.
+                    continue
+                if isinstance(last, AssistantContent) and last.tool_calls:
+                    # Tool calls without results; do not loop forever.
+                    response_text = last.content or _FAILURE_RESPONSE
+                    break
+                if isinstance(last, AssistantContent):
+                    response_text = last.content or _FAILURE_RESPONSE
+                    break
+                response_text = _FAILURE_RESPONSE
+                break
+            else:
+                _LOGGER.warning("Oswald exceeded the tool calling limit")
+                last = chat_log.content[-1]
+                if isinstance(last, AssistantContent) and last.content:
+                    response_text = last.content
+        except InvalidAuthError:
+            self.entry.async_start_reauth(self.hass)
+            response_text = _AUTH_RESPONSE
+        except ChatCompletionError as err:
+            _LOGGER.warning(
+                "Oswald conversation request failed: error_type=%s",
+                type(err).__name__,
+            )
+            if err.status is not None:
+                # The server answered with an error; report its message.
+                response_text = err.message
+            elif progress_any or len(chat_log.content) > initial_length:
+                response_text = _INTERRUPTED_RESPONSE
+            else:
+                response_text = _FAILURE_RESPONSE
+        except (
+            ConnectionFailedError,
+            InvalidResponseError,
+            ClientError,
+            asyncio.TimeoutError,
+            OSError,
+        ) as err:
+            _LOGGER.warning(
+                "Oswald conversation request failed: error_type=%s",
+                type(err).__name__,
+            )
+            if progress_any or len(chat_log.content) > initial_length:
+                response_text = _INTERRUPTED_RESPONSE
+            else:
+                response_text = _FAILURE_RESPONSE
+
+        if len(chat_log.content) > initial_length:
+            tail = chat_log.content[-1]
+            if (
+                isinstance(tail, AssistantContent)
+                and not tail.tool_calls
+                and tail.content == response_text
+            ):
+                return self._result(user_input, conversation_id, response_text)
 
         async for _content in chat_log.async_add_delta_content_stream(
             user_input.agent_id,
-            self._async_oswald_delta_stream(user_input, conversation_id, state),
+            self._single_delta(response_text),
         ):
             pass
 
-        response_text = state["final_response"] or _FAILURE_RESPONSE
         return self._result(user_input, conversation_id, response_text)
 
     @staticmethod
@@ -111,219 +221,154 @@ class OswaldConversationEntity(ConversationEntity):
             continue_conversation=False,
         )
 
-    async def _async_oswald_delta_stream(
-        self,
-        user_input: ConversationInput,
-        conversation_id: str,
-        state: dict[str, Any],
+    @staticmethod
+    async def _single_delta(
+        response_text: str,
     ) -> AsyncGenerator[dict[str, Any], None]:
-        context_user_id = user_input.context.user_id
-        user_id = context_user_id or self.default_user_id
-        if user_id is None:
-            raise RuntimeError("user identity was not validated")
+        yield {"content": response_text}
 
-        ha_user = await self.hass.auth.async_get_user(user_id)
-        if ha_user is None or (
-            context_user_id is None
-            and (not ha_user.is_active or ha_user.system_generated)
-        ):
-            yield {"role": "assistant", "content": _MISSING_USER_RESPONSE}
-            state["final_response"] = _MISSING_USER_RESPONSE
-            return
-        display_name = ha_user.name or "Home Assistant User"
-
-        request_id = str(uuid4())
-        payload = {
-            "type": "conversation",
-            "request_id": request_id,
-            "user_id": user_id,
-            "display_name": display_name,
-            "conversation_id": conversation_id,
-            "text": user_input.text,
-        }
-
-        yield {"role": "assistant"}
-
-        submitted = False
-        try:
-            async with AsyncExitStack() as stack:
-                async with asyncio.timeout(CONNECTION_TIMEOUT_SECONDS):
-                    ws = await stack.enter_async_context(
-                        async_get_clientsession(self.hass).ws_connect(
-                            self.ws_url,
-                            headers={"Authorization": f"Bearer {self.auth_token}"},
-                            autoping=True,
-                            timeout=ClientWSTimeout(ws_receive=None, ws_close=10),
-                        )
-                    )
-                    await expect_ready(ws)
-                    # Even a failed send can have reached the server. Never retry it.
-                    submitted = True
-                    await ws.send_json(payload)
-
-                async for msg in ws:
-                    if msg.type != WSMsgType.TEXT:
-                        raise ProtocolFrameError
-                    delta = self._parse_ws_message(msg.data, request_id, state)
-                    if delta is not None:
-                        yield delta
-                    if state["done"]:
-                        break
-
-                if not state["done"]:
-                    raise ProtocolFrameError
-        except (
-            ClientError,
-            asyncio.TimeoutError,
-            OSError,
-            ProtocolFrameError,
-            UnsupportedProtocolError,
-        ) as err:
-            _LOGGER.warning(
-                "Oswald conversation request failed: error_type=%s",
-                type(err).__name__,
-            )
-            if isinstance(err, WSServerHandshakeError) and err.status == 401:
-                self.entry.async_start_reauth(self.hass)
-                state["final_response"] = _AUTH_RESPONSE
-            else:
-                state["final_response"] = (
-                    _INTERRUPTED_RESPONSE if submitted else _FAILURE_RESPONSE
-                )
-
-        yield self._assistant_delta(
-            state, "content", state["final_response"] or _FAILURE_RESPONSE
-        )
-
-    def _parse_ws_message(
+    async def _stream_turn(
         self,
-        raw: str,
-        request_id: str,
-        state: dict[str, Any],
-    ) -> dict[str, Any] | None:
-        try:
-            data: Any = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            raise ProtocolFrameError from None
-        if not isinstance(data, dict):
-            raise ProtocolFrameError
+        payload: dict[str, Any],
+        state: dict[str, bool],
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        session = async_get_clientsession(self.hass)
+        fragments: dict[int, dict[str, Any]] = {}
+        yielded_any = False
 
-        msg_type = data.get("type")
-        if data.get("request_id") != request_id and not (
-            "request_id" not in data
-            and msg_type == "error"
-            and data.get("code") == "invalid_request"
+        async for chunk in async_stream_chat_completion(
+            session, self.base_url, self.api_key, payload
         ):
-            raise ProtocolFrameError
-        if msg_type in {"content", "thinking"}:
-            text = data.get("text")
-            if not isinstance(text, str) or not text:
-                raise ProtocolFrameError
-            if msg_type == "content":
-                # HA deltas are append-only; previews can differ from result.response.
-                # Only the terminal answer is safe to publish to streaming TTS.
-                return None
-            return self._assistant_delta(state, "thinking_content", text)
+            choices = chunk.get("choices")
+            if not isinstance(choices, list):
+                raise InvalidResponseError("Missing choices")
+            for choice in choices:
+                if not isinstance(choice, dict):
+                    raise InvalidResponseError("Invalid choice")
+                delta = choice.get("delta", {})
+                if not isinstance(delta, dict):
+                    raise InvalidResponseError("Invalid delta")
+                content = delta.get("content")
+                if isinstance(content, str) and content:
+                    yielded_any = True
+                    state["progress"] = True
+                    yield {"content": content}
+                tool_calls = delta.get("tool_calls", [])
+                if not isinstance(tool_calls, list):
+                    raise InvalidResponseError("Invalid tool calls")
+                for tool_call in tool_calls:
+                    if not isinstance(tool_call, dict):
+                        raise InvalidResponseError("Invalid tool call")
+                    index = tool_call.get("index", 0)
+                    if not isinstance(index, int):
+                        raise InvalidResponseError("Invalid tool call index")
+                    fragment = fragments.setdefault(
+                        index, {"id": None, "name": None, "arguments": []}
+                    )
+                    if isinstance(tool_call.get("id"), str) and tool_call["id"]:
+                        fragment["id"] = tool_call["id"]
+                    function = tool_call.get("function", {})
+                    if not isinstance(function, dict):
+                        raise InvalidResponseError("Invalid tool function")
+                    if isinstance(function.get("name"), str) and function["name"]:
+                        fragment["name"] = function["name"]
+                    arguments = function.get("arguments", "")
+                    if not isinstance(arguments, str):
+                        raise InvalidResponseError("Invalid tool arguments")
+                    if arguments:
+                        fragment["arguments"].append(arguments)
 
-        if msg_type == "tool_call":
-            return self._parse_tool_call(data, state)
-        if msg_type == "tool_result":
-            return self._parse_tool_result(data, state)
-        if msg_type == "result":
-            response = data.get("response", "")
-            if not isinstance(response, str):
-                raise ProtocolFrameError
-            state["final_response"] = response
-            state["done"] = True
-            return None
-        if msg_type == "error":
-            code = data.get("code")
-            message = data.get("message")
-            if (
-                not isinstance(code, str)
-                or not code
-                or not isinstance(message, str)
-                or not message
-            ):
-                raise ProtocolFrameError
-            state["final_response"] = message
-            state["done"] = True
-            return None
+        if fragments:
+            tool_inputs: list[llm.ToolInput] = []
+            for index in sorted(fragments):
+                fragment = fragments[index]
+                name = fragment["name"]
+                if not isinstance(name, str) or not name:
+                    raise InvalidResponseError("Missing tool name")
+                try:
+                    args: Any = json.loads("".join(fragment["arguments"]) or "{}")
+                except (json.JSONDecodeError, TypeError) as err:
+                    raise InvalidResponseError("Invalid tool arguments") from err
+                if not isinstance(args, dict):
+                    raise InvalidResponseError("Invalid tool arguments")
+                if isinstance(fragment["id"], str) and fragment["id"]:
+                    tool_inputs.append(
+                        llm.ToolInput(tool_name=name, tool_args=args, id=fragment["id"])
+                    )
+                else:
+                    tool_inputs.append(llm.ToolInput(tool_name=name, tool_args=args))
+            yielded_any = True
+            state["progress"] = True
+            yield {"tool_calls": tool_inputs}
 
-        raise ProtocolFrameError
+        if not yielded_any:
+            raise InvalidResponseError("Empty response")
+
+    def _messages_from_log(self, chat_log: ChatLog) -> list[dict[str, Any]]:
+        messages: list[dict[str, Any]] = []
+        for item in chat_log.content:
+            if isinstance(item, SystemContent):
+                if item.content:
+                    messages.append({"role": "system", "content": item.content})
+            elif isinstance(item, UserContent):
+                messages.append({"role": "user", "content": item.content})
+            elif isinstance(item, AssistantContent):
+                message: dict[str, Any] = {"role": "assistant"}
+                if item.content:
+                    message["content"] = item.content
+                if item.tool_calls:
+                    message["tool_calls"] = [
+                        {
+                            "id": tool_call.id,
+                            "type": "function",
+                            "function": {
+                                "name": tool_call.tool_name,
+                                "arguments": json.dumps(
+                                    tool_call.tool_args, ensure_ascii=False
+                                ),
+                            },
+                        }
+                        for tool_call in item.tool_calls
+                    ]
+                if "content" in message or "tool_calls" in message:
+                    messages.append(message)
+            elif isinstance(item, ToolResultContent):
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": item.tool_call_id,
+                        "content": json.dumps(
+                            item.tool_result, ensure_ascii=False, default=str
+                        ),
+                    }
+                )
+        return messages
 
     @staticmethod
-    def _assistant_delta(state: dict[str, Any], key: str, value: Any) -> dict[str, Any]:
-        delta: dict[str, Any] = {key: value}
-        if state["needs_assistant_role"]:
-            state["needs_assistant_role"] = False
-            delta["role"] = "assistant"
-        return delta
-
-    def _parse_tool_call(
-        self,
-        data: dict[str, Any],
-        state: dict[str, Any],
-    ) -> dict[str, Any]:
-        tool = data.get("tool")
-        if not isinstance(tool, dict):
-            raise ProtocolFrameError
-        tool_name = tool.get("name")
-        arguments = tool.get("arguments") or {}
-        if (
-            not isinstance(tool_name, str)
-            or not tool_name
-            or not isinstance(arguments, dict)
-        ):
-            raise ProtocolFrameError
-
-        tool_input = llm.ToolInput(
-            tool_name=tool_name,
-            tool_args=arguments,
-            external=True,
-        )
-        state["pending_tools"].append((tool_input.id, tool_name))
-        return self._assistant_delta(state, "tool_calls", [tool_input])
-
-    def _parse_tool_result(
-        self,
-        data: dict[str, Any],
-        state: dict[str, Any],
-    ) -> dict[str, Any]:
-        tool = data.get("tool")
-        if not isinstance(tool, dict):
-            raise ProtocolFrameError
-        tool_name = tool.get("name")
-        arguments = tool.get("arguments") or {}
-        if (
-            not isinstance(tool_name, str)
-            or not tool_name
-            or not isinstance(arguments, dict)
-        ):
-            raise ProtocolFrameError
-
-        pending_tools = state["pending_tools"]
-        if not pending_tools:
-            raise ProtocolFrameError
-        tool_call_id, expected_tool_name = pending_tools.pop(0)
-        if tool_name != expected_tool_name:
-            raise ProtocolFrameError
-        tool_result = {
-            "name": tool_name,
-            "arguments": arguments,
-            "result_text": tool.get("result_text"),
-            "duration_ms": tool.get("duration_ms"),
-            "is_error": tool.get("is_error", False),
-        }
-        for key in ("web.search", "web.fetch", "user_memory", "global_memory"):
-            if key in tool:
-                if not isinstance(tool[key], dict):
-                    raise ProtocolFrameError
-                tool_result[key] = tool[key]
-        state["needs_assistant_role"] = True
-        return {
-            "role": "tool_result",
-            "tool_call_id": tool_call_id,
-            "tool_name": tool_name,
-            "tool_result": tool_result,
-        }
+    def _openai_tools(chat_log: ChatLog) -> list[dict[str, Any]]:
+        if chat_log.llm_api is None:
+            return []
+        tools: list[dict[str, Any]] = []
+        for tool in chat_log.llm_api.tools:
+            try:
+                parameters = _schema_to_openapi(
+                    tool.parameters,
+                    custom_serializer=chat_log.llm_api.custom_serializer,
+                )
+            except Exception:
+                _LOGGER.warning(
+                    "Oswald skipping tool with invalid parameters: tool_name=%s",
+                    tool.name,
+                )
+                continue
+            tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description or "",
+                        "parameters": parameters,
+                    },
+                }
+            )
+        return tools
