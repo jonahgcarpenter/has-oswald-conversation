@@ -385,8 +385,7 @@ class OswaldConversationEntity(ConversationEntity):
                 messages.append({"role": "user", "content": item.content})
             elif isinstance(item, AssistantContent):
                 message: dict[str, Any] = {"role": "assistant"}
-                if item.content:
-                    message["content"] = item.content
+                message["content"] = item.content or None
                 if item.tool_calls:
                     message["tool_calls"] = [
                         {
@@ -401,7 +400,7 @@ class OswaldConversationEntity(ConversationEntity):
                         }
                         for tool_call in item.tool_calls
                     ]
-                if "content" in message or "tool_calls" in message:
+                if message.get("content") or "tool_calls" in message:
                     messages.append(message)
             elif isinstance(item, ToolResultContent):
                 messages.append(

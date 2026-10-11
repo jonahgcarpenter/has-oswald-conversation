@@ -16,6 +16,7 @@ from homeassistant.components.conversation.chat_log import (
     UserContent,
 )
 from homeassistant.core import Context
+from homeassistant.helpers.llm import ToolInput
 from homeassistant.setup import async_setup_component
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -219,6 +220,10 @@ async def test_tool_loop(hass, entity, user_input, chat_peer):
     follow_up = calls[1]["payload"]["messages"]
     assistant_msg = next(msg for msg in follow_up if msg.get("tool_calls"))
     assert assistant_msg["tool_calls"][0]["function"]["name"] == tool_name
+    # OpenAI standard: tool-call turn carries explicit null content.
+    assert "content" in assistant_msg
+    assert assistant_msg["content"] is None
+    assert '"content": null' in json.dumps(assistant_msg)
     call_id = assistant_msg["tool_calls"][0]["id"]
     tool_msg = next(msg for msg in follow_up if msg.get("role") == "tool")
     assert tool_msg["tool_call_id"] == call_id
@@ -512,3 +517,75 @@ async def test_reasoning_only_response_is_failure(hass, entity, user_input, chat
     behaviors.append([reasoning_chunk("Considering."), stop_chunk()])
     result, _, _ = await converse(hass, entity, user_input)
     assert speech(result) == _FAILURE_RESPONSE
+
+
+def test_assistant_text_serializes_verbatim(entity):
+    from types import SimpleNamespace
+
+    chat_log = SimpleNamespace(
+        content=[
+            AssistantContent(agent_id="conversation.oswald", content="Hello there.")
+        ]
+    )
+    assert entity._messages_from_log(chat_log) == [
+        {"role": "assistant", "content": "Hello there."}
+    ]
+
+
+def test_assistant_tool_call_serializes_null_content(entity):
+    from types import SimpleNamespace
+
+    chat_log = SimpleNamespace(
+        content=[
+            AssistantContent(
+                agent_id="conversation.oswald",
+                content=None,
+                tool_calls=[
+                    ToolInput(tool_name="test_tool", tool_args={"a": 1}, id="call_1")
+                ],
+            )
+        ]
+    )
+    messages = entity._messages_from_log(chat_log)
+    assert len(messages) == 1
+    message = messages[0]
+    assert message["role"] == "assistant"
+    assert "content" in message
+    assert message["content"] is None
+    assert '"content": null' in json.dumps(message)
+    assert message["tool_calls"] == [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "test_tool", "arguments": '{"a": 1}'},
+        }
+    ]
+
+
+def test_assistant_empty_string_tool_call_serializes_null_content(entity):
+    from types import SimpleNamespace
+
+    chat_log = SimpleNamespace(
+        content=[
+            AssistantContent(
+                agent_id="conversation.oswald",
+                content="",
+                tool_calls=[
+                    ToolInput(tool_name="test_tool", tool_args={}, id="call_1")
+                ],
+            )
+        ]
+    )
+    messages = entity._messages_from_log(chat_log)
+    assert len(messages) == 1
+    assert messages[0]["content"] is None
+
+
+def test_assistant_without_content_or_calls_is_dropped(entity):
+    from types import SimpleNamespace
+
+    for content in (None, ""):
+        chat_log = SimpleNamespace(
+            content=[AssistantContent(agent_id="conversation.oswald", content=content)]
+        )
+        assert entity._messages_from_log(chat_log) == []
