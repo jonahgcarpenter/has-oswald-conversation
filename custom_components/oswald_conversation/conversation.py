@@ -134,6 +134,7 @@ def _format_oswald_tool_entry(entry: Any) -> str | None:
     frontend "Show details" dropdown, mirroring the Ollama integration.
     """
     if not isinstance(entry, dict):
+        _LOGGER.debug("Oswald skipping timeline entry: reason=not_dict")
         return None
     name = entry.get("name")
     phase = entry.get("phase")
@@ -142,22 +143,26 @@ def _format_oswald_tool_entry(entry: Any) -> str | None:
         or not _OSWALD_TOOL_NAME_RE.match(name)
         or phase not in ("call", "result")
     ):
+        _LOGGER.debug("Oswald skipping timeline entry: reason=bad_name_or_phase")
         return None
     if phase == "call":
         arguments = entry.get("arguments", {})
         if arguments is None:
             arguments = {}
         if not isinstance(arguments, dict):
+            _LOGGER.debug("Oswald skipping timeline entry: reason=bad_arguments")
             return None
         try:
             encoded = json.dumps(arguments, ensure_ascii=False, indent=2)
         except (TypeError, ValueError):
+            _LOGGER.debug("Oswald skipping timeline entry: reason=unencodable")
             return None
         if len(encoded) > _OSWALD_TOOL_TEXT_LIMIT:
             encoded = encoded[:_OSWALD_TOOL_TEXT_LIMIT] + "\u2026"
         return f"\n\n`oswald__{name}`\n```json\n{encoded}\n```\n"
     result = entry.get("result_text", "")
     if not isinstance(result, str):
+        _LOGGER.debug("Oswald skipping timeline entry: reason=bad_result")
         return None
     if len(result) > _OSWALD_TOOL_TEXT_LIMIT:
         result = result[:_OSWALD_TOOL_TEXT_LIMIT] + "\u2026"
@@ -277,6 +282,13 @@ class OswaldConversationEntity(ConversationEntity):
                         },
                     }
 
+                _LOGGER.debug(
+                    "Oswald request: stream=%s messages=%d ha_tools=%d oswald_tools=%d",
+                    payload.get("stream"),
+                    len(messages),
+                    len(tools_param),
+                    len(self.oswald_tools),
+                )
                 turn_state = {"received": False, "progress": False}
 
                 try:
@@ -359,6 +371,16 @@ class OswaldConversationEntity(ConversationEntity):
 
         if len(chat_log.content) > initial_length:
             tail = chat_log.content[-1]
+            if isinstance(tail, AssistantContent):
+                _LOGGER.debug(
+                    "Oswald turn: new_items=%d speech_chars=%d tail_content=%s "
+                    "tail_thinking=%s tail_tool_calls=%d",
+                    len(chat_log.content) - initial_length,
+                    len(response_text),
+                    bool(tail.content),
+                    bool(tail.thinking_content),
+                    len(tail.tool_calls or []),
+                )
             if (
                 isinstance(tail, AssistantContent)
                 and not tail.tool_calls
@@ -402,11 +424,18 @@ class OswaldConversationEntity(ConversationEntity):
         session = async_get_clientsession(self.hass)
         fragments: dict[int, dict[str, Any]] = {}
         yielded_any = False
+        chunk_count = 0
+        content_chars = 0
+        reasoning_chars = 0
+        oswald_entry_count = 0
+        oswald_rendered_count = 0
+        oswald_skipped_count = 0
 
         async for chunk in async_stream_chat_completion(
             session, self.base_url, self.api_key, payload
         ):
             state["received"] = True
+            chunk_count += 1
             choices = chunk.get("choices")
             if not isinstance(choices, list):
                 raise InvalidResponseError("Missing choices")
@@ -420,11 +449,13 @@ class OswaldConversationEntity(ConversationEntity):
                 if isinstance(content, str) and content:
                     yielded_any = True
                     state["progress"] = True
+                    content_chars += len(content)
                     yield {"content": content}
                 reasoning = delta.get("reasoning_content")
                 if isinstance(reasoning, str) and reasoning:
                     yielded_any = True
                     state["progress"] = True
+                    reasoning_chars += len(reasoning)
                     yield {"thinking_content": reasoning}
                 oswald_calls = delta.get("oswald_tool_calls", [])
                 if oswald_calls:
@@ -433,11 +464,15 @@ class OswaldConversationEntity(ConversationEntity):
                     for oswald_entry in oswald_calls:
                         if not isinstance(oswald_entry, dict):
                             raise InvalidResponseError("Invalid oswald tool entry")
+                        oswald_entry_count += 1
                         formatted = _format_oswald_tool_entry(oswald_entry)
                         if formatted:
                             yielded_any = True
                             state["progress"] = True
+                            oswald_rendered_count += 1
                             yield {"thinking_content": formatted}
+                        else:
+                            oswald_skipped_count += 1
                 tool_calls = delta.get("tool_calls", [])
                 if not isinstance(tool_calls, list):
                     raise InvalidResponseError("Invalid tool calls")
@@ -481,6 +516,17 @@ class OswaldConversationEntity(ConversationEntity):
             state["progress"] = True
             yield {"tool_calls": tool_inputs}
 
+        _LOGGER.debug(
+            "Oswald SSE turn: chunks=%d content_chars=%d reasoning_chars=%d "
+            "tool_fragments=%d oswald_entries=%d oswald_rendered=%d oswald_skipped=%d",
+            chunk_count,
+            content_chars,
+            reasoning_chars,
+            len(fragments),
+            oswald_entry_count,
+            oswald_rendered_count,
+            oswald_skipped_count,
+        )
         if not yielded_any:
             raise InvalidResponseError("Empty response")
 
