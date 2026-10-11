@@ -76,6 +76,51 @@ _MISSING_CONVERSATION_RESPONSE = "Oswald could not identify this conversation."
 MAX_TOOL_TURNS = 10
 
 
+def _fix_invalid_argument(value: Any) -> Any:
+    """Attempt to repair a tool argument value mangled by a small model.
+
+    Same idea as the Ollama integration: values that look like JSON
+    objects or arrays get one decode attempt, anything else passes
+    through untouched.
+    """
+    if not isinstance(value, str):
+        return value
+    if (value.startswith("[") and value.endswith("]")) or (
+        value.startswith("{") and value.endswith("}")
+    ):
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            pass
+    return value
+
+
+def _parse_tool_args(raw_arguments: str) -> dict[str, Any]:
+    """Parse streamed tool arguments, tolerating small-model mangling.
+
+    Mirrors the Ollama integration's _parse_tool_args: surrounding
+    whitespace is ignored, arguments wrapped in an extra string layer
+    are unwrapped, per-value JSON is repaired, and empty values are
+    omitted. Only truly invalid arguments are rejected.
+    """
+    try:
+        parsed: Any = json.loads(raw_arguments or "{}")
+    except (json.JSONDecodeError, TypeError):
+        parsed = None
+    if isinstance(parsed, str):
+        try:
+            parsed = json.loads(parsed.strip())
+        except json.JSONDecodeError:
+            parsed = None
+    if not isinstance(parsed, dict):
+        raise InvalidResponseError("Invalid tool arguments")
+    return {
+        key: _fix_invalid_argument(value)
+        for key, value in parsed.items()
+        if value is not None and value != ""
+    }
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: ConfigEntry,
@@ -137,13 +182,7 @@ class OswaldConversationEntity(ConversationEntity):
             )
 
         try:
-            llm_context = llm.LLMContext(
-                platform=DOMAIN,
-                context=user_input.context,
-                language=user_input.language,
-                assistant=user_input.agent_id,
-                device_id=user_input.device_id,
-            )
+            llm_context = user_input.as_llm_context(DOMAIN)
             await chat_log.async_provide_llm_data(
                 llm_context,
                 user_llm_hass_api=self.llm_hass_apis or None,
@@ -209,7 +248,16 @@ class OswaldConversationEntity(ConversationEntity):
                     response_text = last.content or _FAILURE_RESPONSE
                     break
                 if isinstance(last, AssistantContent):
-                    response_text = last.content or _FAILURE_RESPONSE
+                    if last.content:
+                        response_text = last.content
+                    elif last.thinking_content:
+                        # Thinking-only turn: the model reasoned without
+                        # answering out loud. Keep the reasoning in the log
+                        # (it feeds the "Show details" dropdown) and answer
+                        # empty, matching HA core result handling.
+                        response_text = ""
+                    else:
+                        response_text = _FAILURE_RESPONSE
                     break
                 response_text = _FAILURE_RESPONSE
                 break
@@ -323,6 +371,8 @@ class OswaldConversationEntity(ConversationEntity):
                     yield {"content": content}
                 reasoning = delta.get("reasoning_content")
                 if isinstance(reasoning, str) and reasoning:
+                    yielded_any = True
+                    state["progress"] = True
                     yield {"thinking_content": reasoning}
                 tool_calls = delta.get("tool_calls", [])
                 if not isinstance(tool_calls, list):
@@ -356,12 +406,7 @@ class OswaldConversationEntity(ConversationEntity):
                 name = fragment["name"]
                 if not isinstance(name, str) or not name:
                     raise InvalidResponseError("Missing tool name")
-                try:
-                    args: Any = json.loads("".join(fragment["arguments"]) or "{}")
-                except (json.JSONDecodeError, TypeError) as err:
-                    raise InvalidResponseError("Invalid tool arguments") from err
-                if not isinstance(args, dict):
-                    raise InvalidResponseError("Invalid tool arguments")
+                args = _parse_tool_args("".join(fragment["arguments"]))
                 if isinstance(fragment["id"], str) and fragment["id"]:
                     tool_inputs.append(
                         llm.ToolInput(tool_name=name, tool_args=args, id=fragment["id"])
@@ -386,6 +431,8 @@ class OswaldConversationEntity(ConversationEntity):
             elif isinstance(item, AssistantContent):
                 message: dict[str, Any] = {"role": "assistant"}
                 message["content"] = item.content or None
+                if item.thinking_content:
+                    message["reasoning_content"] = item.thinking_content
                 if item.tool_calls:
                     message["tool_calls"] = [
                         {
@@ -400,7 +447,11 @@ class OswaldConversationEntity(ConversationEntity):
                         }
                         for tool_call in item.tool_calls
                     ]
-                if message.get("content") or "tool_calls" in message:
+                if (
+                    message.get("content")
+                    or "tool_calls" in message
+                    or "reasoning_content" in message
+                ):
                     messages.append(message)
             elif isinstance(item, ToolResultContent):
                 messages.append(

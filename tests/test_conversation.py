@@ -13,6 +13,7 @@ from homeassistant.components.conversation import (
 )
 from homeassistant.components.conversation.chat_log import (
     AssistantContent,
+    ToolResultContent,
     UserContent,
 )
 from homeassistant.core import Context
@@ -24,6 +25,7 @@ from custom_components.oswald_conversation.client import (
     ChatCompletionError,
     ConnectionFailedError,
     InvalidAuthError,
+    InvalidResponseError,
 )
 from custom_components.oswald_conversation.const import (
     CONF_API_KEY,
@@ -228,6 +230,59 @@ async def test_tool_loop(hass, entity, user_input, chat_peer):
     tool_msg = next(msg for msg in follow_up if msg.get("role") == "tool")
     assert tool_msg["tool_call_id"] == call_id
     assert json.loads(tool_msg["content"])
+
+
+async def test_llm_context_uses_shared_assistant_key(
+    hass, entity, user_input, chat_peer
+):
+    behaviors, _ = chat_peer
+    behaviors.append([content_chunk("Hi."), stop_chunk()])
+    # Fixtures use the entity id as agent; exposure is keyed by the
+    # shared conversation assistant, like every core integration.
+    assert user_input.agent_id == "conversation.oswald"
+    _, chat_log, _ = await converse(hass, entity, user_input)
+    assert chat_log.llm_api is not None
+    assert chat_log.llm_api.llm_context.platform == DOMAIN
+    assert chat_log.llm_api.llm_context.assistant == "conversation"
+
+
+async def test_exposed_entity_visible_to_get_live_context(
+    hass, entity, user_input, chat_peer
+):
+    from homeassistant.components.homeassistant.exposed_entities import (
+        async_set_assistant_option,
+        async_should_expose,
+    )
+    from homeassistant.helpers import entity_registry as er
+
+    entry = er.async_get(hass).async_get_or_create(
+        "light", "test", "kitchen_uid", suggested_object_id="kitchen"
+    )
+    hass.states.async_set(entry.entity_id, "on", {"friendly_name": "Kitchen Light"})
+    async_set_assistant_option(
+        hass, "conversation", entry.entity_id, "should_expose", True
+    )
+
+    # The old entity-id key never matches exposure configuration.
+    assert not async_should_expose(hass, "conversation.oswald", entry.entity_id)
+    assert async_should_expose(hass, "conversation", entry.entity_id)
+
+    behaviors, _ = chat_peer
+    behaviors.append(
+        [tool_call_chunk("homeassistant__GetLiveContext", "{}"), stop_chunk()]
+    )
+    behaviors.append([content_chunk("The kitchen light is on."), stop_chunk()])
+    result, chat_log, _ = await converse(hass, entity, user_input)
+    assert speech(result) == "The kitchen light is on."
+    tool_results = [
+        item for item in chat_log.content if isinstance(item, ToolResultContent)
+    ]
+    assert len(tool_results) == 1
+    assert tool_results[0].tool_result["success"] is True
+    assert "error" not in tool_results[0].tool_result
+    # The exposed light is what the tool saw.
+    assert "domain: light" in tool_results[0].tool_result["result"]
+    assert "state: 'on'" in tool_results[0].tool_result["result"]
 
 
 async def test_rejected_key_starts_reauth(hass, entity, user_input, chat_peer):
@@ -512,11 +567,50 @@ async def test_reasoning_content_becomes_thinking(hass, entity, user_input, chat
     assert "".join(delta.get("content", "") for delta in deltas) == "Answer."
 
 
-async def test_reasoning_only_response_is_failure(hass, entity, user_input, chat_peer):
+async def test_reasoning_only_response_preserves_thinking(
+    hass, entity, user_input, chat_peer
+):
     behaviors, _ = chat_peer
     behaviors.append([reasoning_chunk("Considering."), stop_chunk()])
-    result, _, _ = await converse(hass, entity, user_input)
-    assert speech(result) == _FAILURE_RESPONSE
+    result, chat_log, deltas = await converse(hass, entity, user_input)
+    # A thinking-only turn succeeds with empty speech (HA core behavior),
+    # not the failure message; the reasoning stays in the log for the
+    # "Show details" dropdown.
+    assert speech(result) == ""
+    assert speech(result) != _FAILURE_RESPONSE
+    thinking = [
+        item
+        for item in chat_log.content
+        if isinstance(item, AssistantContent) and item.thinking_content
+    ]
+    assert len(thinking) == 1
+    assert thinking[0].thinking_content == "Considering."
+    assert any(delta.get("thinking_content") == "Considering." for delta in deltas)
+
+
+async def test_thinking_echoed_to_server_on_continuation(
+    hass, entity, user_input, chat_peer
+):
+    tool_name = await assist_tool_name(hass, user_input, "GetDateTime")
+    behaviors, calls = chat_peer
+    behaviors.append(
+        [
+            reasoning_chunk("Let me check. "),
+            tool_call_chunk(tool_name, "{}"),
+            stop_chunk(),
+        ]
+    )
+    behaviors.append([content_chunk("Done."), stop_chunk()])
+    result, chat_log, _ = await converse(hass, entity, user_input)
+    assert speech(result) == "Done."
+    assert len(calls) == 2
+    assistant_msg = next(
+        msg for msg in calls[1]["payload"]["messages"] if msg.get("tool_calls")
+    )
+    # OpenAI standard: tool-call turn carries explicit null content,
+    # with the reasoning echoed back alongside the tool calls.
+    assert assistant_msg["content"] is None
+    assert assistant_msg["reasoning_content"] == "Let me check. "
 
 
 def test_assistant_text_serializes_verbatim(entity):
@@ -589,3 +683,83 @@ def test_assistant_without_content_or_calls_is_dropped(entity):
             content=[AssistantContent(agent_id="conversation.oswald", content=content)]
         )
         assert entity._messages_from_log(chat_log) == []
+
+
+def test_assistant_thinking_serializes_reasoning_content(entity):
+    from types import SimpleNamespace
+
+    chat_log = SimpleNamespace(
+        content=[
+            AssistantContent(
+                agent_id="conversation.oswald",
+                content="Answer.",
+                thinking_content="Considering.",
+            )
+        ]
+    )
+    assert entity._messages_from_log(chat_log) == [
+        {
+            "role": "assistant",
+            "content": "Answer.",
+            "reasoning_content": "Considering.",
+        }
+    ]
+
+
+def test_assistant_thinking_only_serializes_reasoning_content(entity):
+    from types import SimpleNamespace
+
+    chat_log = SimpleNamespace(
+        content=[
+            AssistantContent(
+                agent_id="conversation.oswald",
+                content=None,
+                thinking_content="Considering.",
+            )
+        ]
+    )
+    assert entity._messages_from_log(chat_log) == [
+        {
+            "role": "assistant",
+            "content": None,
+            "reasoning_content": "Considering.",
+        }
+    ]
+
+
+def test_parse_tool_args_repairs_mangled_arguments():
+    from custom_components.oswald_conversation.conversation import _parse_tool_args
+
+    assert _parse_tool_args("") == {}
+    assert _parse_tool_args("{}") == {}
+    assert _parse_tool_args('{"format": "iso"}') == {"format": "iso"}
+    # Arguments wrapped in an extra string layer by a small model.
+    assert _parse_tool_args('"{\\"format\\": \\"iso\\"}"') == {"format": "iso"}
+    # Stringified per-value JSON is repaired; empty values are omitted.
+    assert _parse_tool_args('{"a": "{\\"b\\": 1}", "c": "", "d": null}') == {
+        "a": {"b": 1}
+    }
+    # Truly invalid arguments are still rejected.
+    for raw in ("not-json{{{", "[1, 2]", "null", '"just a string"'):
+        with pytest.raises(InvalidResponseError):
+            _parse_tool_args(raw)
+
+
+async def test_mangled_tool_args_still_call_tool(hass, entity, user_input, chat_peer):
+    tool_name = await assist_tool_name(hass, user_input, "GetDateTime")
+    behaviors, calls = chat_peer
+    behaviors.append(
+        [tool_call_chunk(tool_name, '"{\\"format\\": \\"iso\\"}"'), stop_chunk()]
+    )
+    behaviors.append([content_chunk("Done."), stop_chunk()])
+    result, _, _ = await converse(hass, entity, user_input)
+    assert speech(result) == "Done."
+    assert len(calls) == 2
+
+
+async def test_garbage_tool_args_are_failure(hass, entity, user_input, chat_peer):
+    tool_name = await assist_tool_name(hass, user_input, "GetDateTime")
+    behaviors, _ = chat_peer
+    behaviors.append([tool_call_chunk(tool_name, "not-json{{{"), stop_chunk()])
+    result, _, _ = await converse(hass, entity, user_input)
+    assert speech(result) == _FAILURE_RESPONSE
