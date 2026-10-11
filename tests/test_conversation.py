@@ -823,3 +823,30 @@ async def test_oswald_timeline_invalid_shape_rejected(
     result, chat_log, _ = await converse(hass, entity, user_input)
     assert speech(result) != ""
     assert len(chat_log.content) > 1
+
+
+async def test_stream_opens_with_role_delta(hass, entity, user_input, chat_peer):
+    """The first delta carries the assistant role.
+
+    ha-assist-chat only processes content/thinking/tool deltas after seeing
+    a role (mirrors the Ollama integration); without it, streaming text
+    and Show details never render.
+    """
+    behaviors, _ = chat_peer
+    behaviors.append(
+        [reasoning_chunk("Considering."), content_chunk("Answer."), stop_chunk()]
+    )
+    result, chat_log, deltas = await converse(hass, entity, user_input)
+    assert speech(result) == "Answer."
+    assert deltas[0] == {"role": "assistant"}
+    answers = [item for item in chat_log.content if isinstance(item, AssistantContent)]
+    assert len(answers) == 1
+    assert answers[0].content == "Answer."
+    assert answers[0].thinking_content == "Considering."
+
+
+async def test_single_delta_opens_with_role_delta(hass, entity, user_input):
+    """The fallback single delta also opens with the assistant role."""
+    seen = [delta async for delta in entity._single_delta("Hi.")]
+    assert seen[0] == {"role": "assistant"}
+    assert seen[1] == {"content": "Hi."}
