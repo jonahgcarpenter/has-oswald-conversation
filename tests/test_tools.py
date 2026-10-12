@@ -15,6 +15,9 @@ def test_registry_names():
         "session_search",
         "web_search",
         "vision_analyze",
+        "tool_search",
+        "tool_describe",
+        "tool_call",
     ]
     assert "image_generate" not in BUILTIN_TOOL_NAMES
     assert BUILTIN_TOOL_NAMES == SERVER_OFFERABLE_TOOLS

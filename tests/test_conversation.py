@@ -450,6 +450,9 @@ async def test_options_override_model_prompt_apis_and_history(
         "session_search",
         "web_search",
         "vision_analyze",
+        "tool_search",
+        "tool_describe",
+        "tool_call",
     ]
     assert payload["messages"][0]["role"] == "system"
     assert "Custom instructions XYZ." in payload["messages"][0]["content"]
