@@ -30,6 +30,9 @@ OSWALD_BUILTIN_TOOLS: tuple[OswaldBuiltinTool, ...] = (
     OswaldBuiltinTool(name="session_search", label="Session search"),
     OswaldBuiltinTool(name="web_search", label="Web search"),
     OswaldBuiltinTool(name="vision_analyze", label="Vision"),
+    OswaldBuiltinTool(name="tool_search", label="Tool search"),
+    OswaldBuiltinTool(name="tool_describe", label="Tool describe"),
+    OswaldBuiltinTool(name="tool_call", label="Tool call"),
 )
 
 SERVER_OFFERABLE_TOOLS: frozenset[str] = frozenset(
